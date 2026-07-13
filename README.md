@@ -34,6 +34,8 @@
 ## ⚡ Quickstart
 
 ```bash
+brew install fire17/tap/termi        # macOS/Linuxbrew
+# or, anywhere:
 git clone https://github.com/fire17/termi && cd termi && ./install.sh
 ```
 

@@ -3,4 +3,3 @@ __pycache__/
 *.pyc
 conversation/
 .save_and_ship/
-.project/

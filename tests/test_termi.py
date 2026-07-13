@@ -77,7 +77,7 @@ class TermiTest(unittest.TestCase):
     def test_version(self):
         r = self.h.run("version")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("termi 0.1.0", r.stdout)
+        self.assertIn("termi 0.2.0", r.stdout)
 
     def test_packs_lists_fixture(self):
         r = self.h.run("packs")

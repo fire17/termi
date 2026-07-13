@@ -1,0 +1,30 @@
+name: ci
+on:
+  push: {branches: [main]}
+  pull_request:
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shells (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q zsh fish
+      - name: Shell inventory (honest matrix — skips are visible)
+        run: |
+          for s in zsh bash fish pwsh nu; do
+            command -v "$s" >/dev/null && echo "present: $s" || echo "absent:  $s"
+          done
+      - name: Tests
+        run: python3 -m unittest discover -s tests -v 2>&1 | tail -20
+      - name: Budget — termi env under 1s
+        run: |
+          export HOME="$RUNNER_TEMP/h" TERMI_DIR="$RUNNER_TEMP/h/.termi"
+          mkdir -p "$HOME"
+          t0=$(date +%s%N); python3 bin/termi env >/dev/null; t1=$(date +%s%N)
+          ms=$(( (t1 - t0) / 1000000 )); echo "termi env: ${ms}ms"
+          test "$ms" -lt 1000

@@ -1,150 +1,138 @@
-# Termi 🖥️💛 — your Terminal Friend
+<div align="center">
 
-**One command and you're home.** Termi is the holistic terminal experience — it sets up,
-heals, teaches, upgrades, migrates, shares, and syncs your entire dev-env. A friend for
-newcomers opening a terminal for the first time, and a level-up even for engineers with
-decades of muscle memory. *"Docker from the future, tailored to dev-envs and the terminal
-holistic end-to-end experience."*
+<img src="assets/banner.svg" width="100%" alt="termi — your Terminal Friend"/>
 
-The founding vision is preserved verbatim in [VISION.md](VISION.md) (SACRED — never edit).
-This file is the derived, living map. **Before working on Termi, read [ORACLE.md](ORACLE.md)**
-— the wartable pseudo-oracle (2026-07-06): ADRs, playbooks, risk register, invariants,
-escalation contract. The moment reality diverges from it, stop and log the divergence.
+[![release](https://img.shields.io/github/v/release/fire17/termi?color=e8b84a)](https://github.com/fire17/termi/releases)
+[![ci](https://github.com/fire17/termi/actions/workflows/ci.yml/badge.svg)](https://github.com/fire17/termi/actions/workflows/ci.yml)
+[![tests](https://img.shields.io/badge/tests-87%2F87%20·%200%20skips-2ea44f)](tests/)
+[![shells](https://img.shields.io/badge/shells-zsh%20·%20bash%20·%20fish%20·%20pwsh-4ad1c8)](support/shells.toml)
+[![deps](https://img.shields.io/badge/python-3.11%2B%20·%20stdlib--only-3776ab)](bin/termi)
+[![built with](https://img.shields.io/badge/built%20with-Claude%20Fable%205-1a1030)](ORACLE.md)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![stars](https://img.shields.io/github/stars/fire17/termi?style=social)](https://github.com/fire17/termi/stargazers)
 
-## v0.2 — universal environments (2026-07-13)
+<i>The terminal you love, everywhere — and a friend who never lies about what works.</i>
 
-```
-termi env             # OS · terminal · mux · shells · harnesses + honest coverage matrix (0.075s)
-termi env --deep      # + live activation probe per shell (TERMI_ACTIVE round-trip)
-termi shells enable bash|fish|powershell|…   # managed block + loader, any registered shell
-termi install recover --shell bash           # per-shell pack variants
-termi skill install   # the bundled agent skill → every detected harness (6 known)
-termi enable/disable <pack>/<item>           # feature control, snapshot-guarded
-termi                 # TUI v2: the control center — see everything, toggle anything
-```
+**[⚡ Quickstart](#-quickstart)** · **[🩺 What it does](#-what-your-friend-does)** · **[🌍 Any shell](#-any-shell-any-terminal-any-os)** · **[🤖 AI harnesses](#-the-part-that-should-stop-you)** · **[🛟 Safety](#-safety--undo)** · **[🔬 Making of](#-how-this-was-actually-built)**
 
-Registries in `support/*.toml` — a new shell/terminal/harness is an additive TOML entry
-(test-enforced). Live-verified here: zsh+bash+fish+pwsh blocks all "on", typo-recovery
-working in real bash AND real PowerShell 7.6. 87/87 tests, 0 skips.
-Protocol docs: `BUDGETS.md · IA.md · PATTERNS.md · SWARM.md · DARWIN.md`.
-
-## v0.1 is real (2026-07-06)
-
-```
-./install.sh          # symlinks ~/.local/bin/termi (idempotent)
-termi doctor          # 3-state honesty: missing / installed-not-active / active
-termi packs           # 8 packs, 22 items (shell-qol, navigation, hints, recover, keys, jumpto, modern-unix, dev)
-termi keys            # editor-style keys: what's bound + YOUR emulator's exact settings
-termi keys apply      # writes ⌘←/⌘→/⌘⌫/⇧⌘← into your emulator's config (managed block, undoable)
-termi keys probe      # learns the real byte sequences your terminal sends (F16)
-termi install <pack>  # consent per item, snapshot first, managed-block only
-termi export -o me.toml && termi import friend.toml   # profiles, secret-screened, R1-guarded
-termi undo            # byte-exact restore of the pre-change state
-termi                 # the TUI menu
-```
-
-**37/37 tests** (`python3 -m unittest discover -s tests`). The strongest ones drive a REAL
-interactive zsh through a pty and ask ZLE for its own `$BUFFER`/`$CURSOR` — screen-scraping
-lies, because zsh's redraw uses backspaces (`tests/test_keys_pty.py`; the model for verifying
-any shell-side feature). Live on this machine: ⌥←/⌥→/⌃← jump words, ⌥⌫ deletes a word,
-⇧⌥← selects and typing replaces it, words break on `/` in paths, plain arrows untouched;
-typo recovery chains onto a pre-existing `command_not_found_handler` instead of being shut
-out by it. `install.ps1` (WSL on-ramp) is still NOT Windows-verified.
-
-> **Ship = build + install + a real keypress.** F16 was built, tested and demoed while
-> never actually installed — so ⌥← printed `;3D` in fire17's shell. Two bugs hid behind
-> green tests: the installer rejected every snippet-only pack (keys *and* recover could
-> never install, on any machine), and doctor reported `✓ active` for recover while another
-> handler owned the hook. Both fixed, both now guarded by tests. See ORACLE §4 P17/P18.
+</div>
 
 ---
 
-## Feature map (from the vision)
+## 🤖 The part that should stop you
 
-| # | Feature | Status |
-|---|---------|--------|
-| F1 | **psst** — tips & warnings before commands run | ✅ EXISTS — shipped v0.4.0, [github.com/fire17/psst](https://github.com/fire17/psst), incl. THE GUARD countdown |
-| F2 | **Auto-recovered commands** — auto-fixes typos | ✅ MVP — `recover` pack: OSA-distance matcher, suggests + preloads, never auto-runs (ADR-8) |
-| F3 | **Native AI in the terminal** — questions & actions; deep mode when combined with any harness (herdr++) | idea |
-| F4 | **Junior onboarding** — help a first-timer set up their terminal end-to-end | 🔨 partial — `termi install` consent-per-item walk + P4 fresh-file birth |
-| F5 | **WSL advocacy** — detect Windows PowerShell, kindly scold, explain why serious engineering happens on Linux/WSL, then *walk them through it* (harness-assisted if available) | 🔨 `install.ps1` written, NOT Windows-verified |
-| F6 | **Env checks & upgrades** — zsh, battle-tested beautiful statusline, fish-like autosuggestions, zoxide-fuzzy native `cd` via **bettercd** | ✅ `termi doctor` live (3-state honesty); bettercd shipped |
-| F7 | **Migrate / cherry-pick** — restore from your backups OR adopt pieces of setups shared by friends/online; choose how much (or all) to take | ✅ MVP — `termi import` (typed-yes untrusted gate) |
-| F8 | **Share your own setup** — export what you love, others cherry-pick from it | ✅ MVP — `termi export` (tools + zinit plugins, secret-screened) |
-| F9 | **Community features** — (later, once F7/F8 prove out) | future |
-| F10 | **SSO/OAuth sign-in → cross-device sync** — never set up from scratch again; 1-command return to the terminal you love | future (profile format is sync-ready, ADR-6) |
-| F11 | **Adopt anything already on your system** into your Termi profile | 🔨 partial — export captures active tools + plugin lines |
-| F12 | **Hooks, events, triggers** + more interactions/interfaces/user-stories | idea |
-| F13 | **Programmatic reproduction** — declarative, deterministic dev-env ("docker from the future") | 🔨 partial — `profile.toml` declarative; lockfile pending |
-| F14 | **Own CLI + CLI TUI + agent skills** | 🔨 CLI ✅ + minimal TUI ✅; agent skills pending |
-| F15 | **jjk upnext** (board `T67` / seed S25) — awaiting definition from fire17 | queued |
-| F18 | **tmux + herdr optimizations out of the box** (Addendum 3) — 📌 "remember that for later", by fire17's word | planned — deliberately deferred |
-| F19 | **Universal shell support** (Addendum 3) — zsh · bash · fish · PowerShell · nushell, extensible by TOML entry alone | ✅ registry + engine live; matrix: zsh ●●●●● · bash ●●◐ · fish ●/native · pwsh ●●/native · nu scaffolded |
-| F20 | **Cross-platform installer** (Addendum 3) — POSIX sh + PowerShell, auto-detect, coverage matrix + agent one-liner as the post-install screen | ✅ both parse-verified & idempotent; Windows-native flow NOT live-verified |
-| F21 | **Bundled agent skill + harness detection** (Addendum 3) — `termi skill install` into claude-code/codex/opencode/pi/openclaw/hermes | ✅ live-installed into claude-code + codex (skill hot-loaded mid-build); guessed dirs skipped honestly |
-| F22 | **Control-everything TUI** (Addendum 3) — see + toggle every feature/pack/shell from one raw-mode control center | ✅ TUI v2 + `termi enable/disable/shells` verbs |
-| F17 | **jumpto** (2026-07-13, EXPERIMENTAL) — ⌘⌥←/→ enters a jump-to-text mode: type, and the cursor flies to the match inside your line — fuzzy + case-insensitive; ⌃N/↓/Tab next · ⌃P/↑ prev · ↵ accept · Esc cancel | ✅ opt-in pack (`termi install jumpto`); `TERMI_JUMPTO=0` disables |
-| F16 | **Great keyboard & mouse in every terminal** (2026-07-13) — ⌥/⌃/⌘ word+line jumps, ⌥⌫ delete-word, ⇧⌥←/→ select like a normal app, click-to-move-caret | ✅ — `keys` pack (ZLE half) · `termi keys apply` (writes the emulator's config for ⌘←/⌘→/⌘⌫/⇧⌘←, managed-block + undo) · `termi keys probe` (learns your terminal's real byte sequences) |
+**termi installs itself into your AI agent — and its coverage matrix is incapable of overstating.**
 
-## Recommendations (Claude 💭 — the "what am I missing" list)
+- `termi skill install` detects whatever AI harness lives on your machine — **Claude Code, Codex, OpenCode, Pi, OpenClaw** — and installs a bundled agent skill into each one, with consent per harness. During the very session that built this feature, the skill hot-loaded into the building agent's own harness and started answering. ([the skill](skills/termi/SKILL.md))
+- Every cell in `termi env`'s coverage matrix uses a five-word honesty vocabulary — `verified · native · core · planned · untested` — and **`verified` requires a passing test on a real shell** ([support/shells.toml](support/shells.toml), enforced by [the suite](tests/)). No cell can claim more than CI proves.
+- The doctor reports **three states, not two**: `missing`, `active`, and the one every tool hides — `installed-but-not-active`. The half-configured shell that "looks done" is the bug class this project treats as radioactive.
+- Typo-recovery was proven the same afternoon in **real bash and real PowerShell 7.6** — not "should work": `gti` → *did you mean git?* in both, captured live.
 
-**Shell layer** — fzf (fuzzy history/files everywhere — foundational, pairs with bettercd),
-zsh-syntax-highlighting (red-before-you-run), atuin (SQLite shell history with encrypted
-sync — *this is the F10 sync story for history, already solved*), completions everywhere.
+> [!IMPORTANT]
+> One CLI that diagnoses, configures, and carries your whole terminal life — across shells, terminals, OSs, and AI harnesses — with every claim backed by a test you can run.
 
-**Modern replacements pack** — eza (ls), bat (cat), fd (find), ripgrep (grep), delta (git
-diff), dust/duf (du/df), btop (top), tealdeer (tldr — example-first man pages; natural psst
-sibling). Ship as an opt-in "modern-unix" pack — psst already nudges toward these, so Termi
-installs what psst preaches.
+## ⚡ Quickstart
 
-**Statusline** — starship as the battle-tested default (cross-shell, TOML, fast), powerlevel10k
-as the zsh-native alternative; Nerd Font install is the hidden prerequisite Termi must handle
-(the #1 silent failure for juniors — broken glyphs).
-
-**Env & runtime** — mise (asdf successor: per-project runtimes + env), direnv, gh CLI.
-**Terminal emulator counsel** — ghostty/kitty/wezterm recommendations per-OS + font setup.
-
-**Substrate for F7/F8/F13 (the big one)** — a declarative **Termi profile**: a single
-manifest (`termi.yaml` + lockfile) listing shell, plugins, packs, tools, dotfiles, secrets
-policy. `termi apply` is idempotent; every apply snapshots prior state → `termi undo`.
-chezmoi (templates + age-encrypted secrets) is the strongest existing engine to build on or
-learn from. Cherry-picking = selecting entries from someone else's manifest — never raw
-file copies. **Never clobber** the user's existing config: additive, reversible, diff-first.
-
-**Safety rails** — trash-put over rm, `--force-with-lease` habits — psst's GUARD already
-covers the warn-and-hold half; Termi installs the safer defaults half.
-
-**The doctor** — `termi doctor`: one command that checks every layer (shell, PATH health,
-font/glyphs, git identity, ssh keys, plugin conflicts, startup-time budget with per-plugin
-blame) and offers fixes. This is the recurring re-entry point and the junior's lifeline.
-
-**Sync (F10) staging** — offline-first: profile in a private git repo or E2E-encrypted blob
-first (works TODAY, no auth server); SSO/OAuth becomes a convenience layer over the same
-format later. Atuin proves the encrypted-sync pattern.
-
-## Architecture sketch 💭
-
-```
-termi CLI ─┬─ doctor      # detect & heal (F5, F6)
-           ├─ setup       # guided onboarding, packs (F4)
-           ├─ profile     # export / import / cherry-pick / apply / undo (F7, F8, F11, F13)
-           ├─ ai          # native ai + harness bridge (F3, herdr++)
-           ├─ hooks       # events & triggers (F12)
-           └─ tui         # the friendly face (F14)
-agent skills: termi-setup / termi-doctor / termi-migrate  (F14)
+```bash
+git clone https://github.com/fire17/termi && cd termi && ./install.sh
 ```
 
-## Ecosystem ties
+then type `termi` — the control center opens. (Windows: `install.ps1`. The installer ends by printing your machine's live coverage matrix.)
 
-- **psst** and **bettercd** are shipped, published Termi ingredients — Termi orchestrates them.
-- **herdr** is the harness layer F3 refers to ("herdr++").
-- Registry entry: `~/Creations/termi.md` · Seed **S25** ⇄ board **T67** (`~/General/todos/TODOS.md`, P11 Products & Apps).
+## 🩺 What your friend does
 
-## Roadmap sketch 💭
+| You type | You get |
+|---|---|
+| `termi` | **TUI control center** — see every feature, toggle anything, arrow keys |
+| `termi doctor` | 3-state health across 22 tools — exit 0 only when everything is truly *active* |
+| `termi env` | OS · terminal · multiplexer · shells · AI harnesses + honest coverage matrix, in **~75ms** |
+| `termi install <pack>` | consent-per-item setup: [shell-qol, navigation, hints, recover, keys, jumpto, modern-unix, dev](packs/) |
+| `gti status` *(a typo)* | `termi 💛 did you mean git? (preloaded — just press ↵)` — suggests, **never auto-runs** |
+| `⌥←/→ · ⌘←/→ · ⇧⌘←` | editor-grade keys in your shell — `termi keys apply` configures the terminal side too |
+| `⌘⌥→` then typing | **jumpto** — fuzzy jump-to-text inside your command line (experimental, off-switch) |
+| `termi export` / `import` | your whole setup as one shareable file — secret-screened, untrusted-code gated |
+| `termi undo` | byte-exact restore of the last change, always |
 
-1. **v0.1 — doctor + packs**: `termi doctor` + zsh/starship/autosuggestions/fzf/bettercd/psst
-   install with consent-per-item. Immediately valuable, no accounts, no sync.
-2. **v0.2 — profiles**: manifest + apply/undo/export; migrate-from-backup; cherry-pick from a shared file.
-3. **v0.3 — TUI + AI**: the friendly face; native ai + harness detection.
-4. **v0.4 — WSL flow** + Windows detection story.
-5. **v1.0 — sync**: git/E2E first, SSO layer after. Community features once sharing proves out.
+## 🌍 Any shell, any terminal, any OS
+
+```mermaid
+flowchart LR
+    A["termi env"] --> B["detects<br/><i>OS · terminal · mux<br/>shells · harnesses</i>"]
+    B --> C["coverage matrix<br/><i>every ● = a passing test</i>"]
+    C --> D["termi shells enable bash"]
+    C --> E["termi keys apply<br/><i>terminal config, managed block</i>"]
+    C --> F["termi skill install<br/><i>→ your AI agent</i>"]
+    style A fill:#1a1030,stroke:#e8b84a,color:#f5d67b
+    style C fill:#0d1322,stroke:#4ad1c8,color:#7be8b8
+    style F fill:#1a1030,stroke:#e8b84a,color:#f5d67b
+```
+
+Shells, terminals, and AI harnesses are **data, not code** — each is a TOML entry in [`support/`](support/). Adding one requires zero python (there's a test that adds a fake shell and enables it end-to-end). Current truth:
+
+| shell | block | recover | keys | notes |
+|---|---|---|---|---|
+| zsh | ● | ● | ● (+jumpto, ⇧-select) | the full experience |
+| bash | ● | ● | ◐ readline motions | chains your existing `command_not_found_handle` |
+| fish | ● | ○ | ◆ native | fish ships its own autosuggestions |
+| PowerShell | ● | ● | ◆ PSReadLine | proven on pwsh 7.6 · Windows-native not yet live-verified |
+| nushell | ○ | ○ | ○ | scaffolded — parse-time loader pending |
+
+● verified (a test proves it) · ◆ the shell provides it natively · ◐ core · ○ planned
+
+<details><summary><b>📦 The eight packs (22 items)</b></summary>
+
+- **shell-qol** — fzf · autosuggestions · syntax-highlighting · statusline (starship, or your p10k counts)
+- **navigation** — zoxide · [bettercd](https://github.com/fire17/bettercd)
+- **hints** — [psst](https://github.com/fire17/psst): gentle whispers before a command runs
+- **recover** — typo auto-recovery (OSA distance: catches `gti`, `pyhton`, `brwe` transpositions)
+- **keys** — word/line motions, ⇧-selection, ⌘⌫, delete-word — plus the *emulator* half via `termi keys apply` (wezterm/kitty/ghostty managed blocks; GUI steps for iTerm2/Terminal.app)
+- **jumpto** — ⌘⌥←/→ fuzzy jump-to-text mode (experimental, `TERMI_JUMPTO=0` kills it)
+- **modern-unix** — eza · bat · fd · ripgrep · delta · dust · tealdeer · btop
+- **dev** — gh · mise · direnv · atuin
+
+</details>
+
+<details><summary><b>🔧 Extending termi (new shell / terminal / harness)</b></summary>
+
+Add a TOML entry to [`support/shells.toml`](support/shells.toml) (detect command, rc path, managed-block line, loader, honest feature statuses), and `termi env` detects it, `termi shells enable <id>` configures it. Same for terminals and harnesses. Statuses start `planned` — they may only say `verified` when a test in [`tests/`](tests/) proves the claim. The dev-side map lives in [DEVMAP.md](DEVMAP.md); the engineering playbook in [ORACLE.md](ORACLE.md).
+
+</details>
+
+## 🛟 Safety & undo
+
+| | |
+|---|---|
+| **What install touches** | one marked block in your rc file (`# >>> termi >>>` … `# <<< termi <<<`) + files under `~/.termi/` — never a byte outside the markers |
+| **Your existing config** | never rewritten — symlinked rc files edited at their target, existing `command_not_found` handlers **chained**, never clobbered |
+| **Every mutation** | snapshot first → `termi undo` restores byte-exact (proven by test) |
+| **Typo recovery** | suggests + preloads — **never executes** a guessed command |
+| **Imported profiles** | untrusted shell code shown in full, requires typing `yes` — a bare `y` is rejected; secrets are screened out of exports |
+| **Uninstall** | `termi undo` (or delete the marked block + `~/.termi/`) |
+
+## 🔬 How this was actually built
+
+Built end-to-end by **Claude (Fable 5)** in Claude Code, from [fire17](https://github.com/fire17)'s verbatim vision ([VISION.md](VISION.md) — preserved character-exact, sha-footered, typos included). Before code: a war-game planning pass produced [ORACLE.md](ORACLE.md) — 13 architecture decisions, 25 symptom-keyed playbooks, and a field log every later session must consult.
+
+```mermaid
+flowchart TD
+    V["VISION.md<br/><i>verbatim, sacred</i>"] --> W["wargame → ORACLE.md<br/><i>ADRs · playbooks · risk register</i>"]
+    W --> B["build + live-verify<br/><i>real shells, real pty, real keypresses</i>"]
+    B --> T["87 tests · 0 skips<br/><i>fish + pwsh installed just to prove claims</i>"]
+    T --> S["ship gates<br/><i>parser-validated installers · this README battery</i>"]
+    style V fill:#1a1030,stroke:#e8b84a,color:#f5d67b
+    style T fill:#0d1322,stroke:#4ad1c8,color:#7be8b8
+```
+
+**Defects the process caught before you could** (the full list lives in ORACLE's field log): the installer silently rejected every shell-native pack; the doctor once reported a feature `✓ active` while another handler owned the hook; `harness+"s"` built `harnesss.toml` and every AI harness vanished; a fixed key-read window dropped arrow-key bytes under load; `re.sub` crashed on `\x1b` in a replacement — **on the second run only**. Each one is now a regression test and a written playbook.
+
+## ⭐ If termi saved you an evening
+
+termi's whole philosophy is that a claim needs a receipt. Stars are the receipt that this should keep growing — toward nushell, Windows-native verification, and the tmux/herdr layer. If the matrix's honesty won you over, [leave the receipt](https://github.com/fire17/termi/stargazers).
+
+[![Star History Chart](https://api.star-history.com/svg?repos=fire17/termi&type=Date)](https://star-history.com/#fire17/termi&Date)
+
+**Siblings:** [psst](https://github.com/fire17/psst) — hints before you need them · [bettercd](https://github.com/fire17/bettercd) — a better cd · [fable-masterclass](https://github.com/fire17/fable-masterclass) — the engineering doctrine behind this build
+
+License: [MIT](LICENSE)
+
+<div align="center"><sub><i>termi 💛 — because the terminal should feel like home, on every machine you'll ever touch.</i></sub></div>

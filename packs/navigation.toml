@@ -1,0 +1,27 @@
+# navigation — never type a full path again
+[pack]
+name = "navigation"
+
+[[item]]
+name = "zoxide"
+why = "a smarter cd that learns your habits — jump to any dir from anywhere"
+check = "command -v zoxide"
+active = "(( $+functions[__zoxide_z] ))"
+brew = "zoxide"
+apt = "zoxide"
+snippet = '''command -v zoxide >/dev/null 2>&1 && eval "$(zoxide init zsh)"'''
+order = 40
+
+[[item]]
+name = "bettercd"
+why = "fire17's better cd — zoxide-aware fuzzy jumps, auto-mkdir, undo (github.com/fire17/bettercd)"
+check = "test -r \"$(brew --prefix 2>/dev/null)/opt/bettercd/share/bettercd/bettercd.sh\""
+active = "(( $+functions[bettercd] ))"
+brew = "fire17/tap/bettercd"
+snippet = '''
+_p="$(brew --prefix 2>/dev/null)/opt/bettercd/share/bettercd/bettercd.sh"
+[[ -r "$_p" ]] && source "$_p"
+unset _p
+'''
+post = "run `bettercd doctor` in a fresh shell to confirm"
+order = 45

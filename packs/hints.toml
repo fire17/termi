@@ -1,0 +1,17 @@
+# hints — the friend whispering over your shoulder
+[pack]
+name = "hints"
+
+[[item]]
+name = "psst"
+why = "gentle hints right before a command runs — fire17's psst (github.com/fire17/psst)"
+check = "command -v psst"
+active = "(( $+functions[_psst_preexec] ))"
+brew = "fire17/tap/psst"
+snippet = '''
+_p="$(brew --prefix 2>/dev/null)/opt/psst/psst.plugin.zsh"
+[[ -r "$_p" ]] && source "$_p"
+unset _p
+'''
+post = "try: psst add nano 'use bat to read, $EDITOR to edit :D' — then type nano"
+order = 25

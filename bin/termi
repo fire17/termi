@@ -1,0 +1,1723 @@
+#!/usr/bin/env python3
+"""termi — your Terminal Friend 💛
+
+Diagnose, set up, and carry your terminal with you.
+Stdlib-only by law (ORACLE.md ADR-1). Mutations are snapshot-guarded and
+confined to ~/.termi plus one managed block in ~/.zshrc (ADR-3).
+"""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import tomllib  # py >= 3.11 (ORACLE P1)
+except ModuleNotFoundError:  # pragma: no cover
+    sys.stderr.write("termi needs Python >= 3.11 (tomllib). See ORACLE.md P1.\n")
+    sys.exit(2)
+
+VERSION = "0.2.0"
+
+TERMI_DIR = Path(os.environ.get("TERMI_DIR", str(Path.home() / ".termi")))
+ZSHRC = Path(os.environ.get("TERMI_ZSHRC", str(Path.home() / ".zshrc")))
+ZSHD = TERMI_DIR / "zsh.d"
+SNAPS = TERMI_DIR / "snapshots"
+STATE = TERMI_DIR / "state.json"
+LOADER = TERMI_DIR / "termi.zsh"
+
+MARK_BEGIN = "# >>> termi >>>"
+MARK_END = "# <<< termi <<<"
+BLOCK = (
+    f"{MARK_BEGIN}  (managed by termi — do not edit inside; `termi undo` reverts)\n"
+    '[[ -r "$HOME/.termi/termi.zsh" ]] && source "$HOME/.termi/termi.zsh"\n'
+    f"{MARK_END}"
+)
+
+
+def block_re(marker: str) -> re.Pattern:
+    """Managed-block matcher for any comment style ('#', '--')."""
+    return re.compile(re.escape(f"{marker} >>> termi >>>") + r".*?"
+                      + re.escape(f"{marker} <<< termi <<<"), re.DOTALL)
+
+
+BLOCK_RE = block_re("#")
+
+LOADER_BODY = """\
+# termi shell loader — sources every enabled snippet. Managed by termi.
+for _termi_f in "$HOME/.termi/zsh.d"/*.zsh(N); do
+  source "$_termi_f"
+done
+unset _termi_f
+"""
+
+SECRET_RE = re.compile(
+    r"(?i)(api[_-]?key|access[_-]?key|auth[_-]?token|token|secret|passwd|password"
+    r"|BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16})"
+)
+
+
+# ── support registries (ORACLE ADR-12: shells/terminals/harnesses are DATA) ──
+def support_dir() -> Path:
+    env = os.environ.get("TERMI_SUPPORT_DIR")  # hermetic override for tests
+    return Path(env) if env else Path(__file__).resolve().parent.parent / "support"
+
+
+_support_cache: dict[str, list] = {}
+
+
+SUPPORT_FILES = {"shell": "shells.toml", "terminal": "terminals.toml",
+                 "harness": "harnesses.toml"}
+
+
+def load_support(kind: str) -> list[dict]:
+    """kind: 'shell' | 'terminal' | 'harness' — from support/ (ADR-12)."""
+    if kind not in _support_cache:
+        f = support_dir() / SUPPORT_FILES[kind]
+        _support_cache[kind] = tomllib.loads(f.read_text()).get(kind, []) if f.exists() else []
+    return _support_cache[kind]
+
+
+class Shell:
+    def __init__(self, raw: dict):
+        self.id = raw["id"]
+        self.name = raw["name"]
+        self.detect = raw["detect"]
+        rc = raw.get("rc_windows") if os.name == "nt" and raw.get("rc_windows") else raw["rc"]
+        self.rc = Path(os.path.expanduser(rc))
+        self.comment = raw.get("comment", "#")
+        self.dir = TERMI_DIR / raw["dir"]
+        self.ext = raw["ext"]
+        self.loader_path = TERMI_DIR / raw["loader_file"]
+        self.block_line = raw["block"]
+        self.loader_body = raw["loader"]
+        self.probe = raw.get("probe")
+        self.probe_echo = raw.get("probe_echo")
+        self.features = raw.get("features", {})
+        self.notes = raw.get("notes", "")
+
+    def block_text(self) -> str:
+        c = self.comment
+        return (f"{c} >>> termi >>>  (managed by termi — do not edit inside; "
+                f"`termi undo` reverts)\n{self.block_line}\n{c} <<< termi <<<")
+
+    def rc_path(self) -> Path:
+        """Test override for zsh keeps legacy TERMI_ZSHRC semantics."""
+        if self.id == "zsh":
+            return ZSHRC
+        return self.rc
+
+
+def shells() -> dict[str, Shell]:
+    return {s["id"]: Shell(s) for s in load_support("shell")}
+
+
+def shell_present(sh: Shell) -> bool:
+    return subprocess.run(["sh", "-c", sh.detect], capture_output=True,
+                          timeout=10).returncode == 0
+
+
+def current_shell_id() -> str:
+    base = os.path.basename(os.environ.get("SHELL", ""))
+    return {"pwsh": "powershell"}.get(base, base) or "unknown"
+
+
+def detect_os() -> str:
+    s = platform.system()
+    if s == "Darwin":
+        return "macos"
+    if s == "Windows":
+        return "windows"
+    if s == "Linux":
+        try:
+            if "microsoft" in Path("/proc/version").read_text().lower():
+                return "wsl"
+        except OSError:
+            pass
+        return "linux"
+    return s.lower()
+
+
+def detect_mux() -> str | None:
+    if os.environ.get("HERDR_SESSION"):
+        return f"herdr ({os.environ['HERDR_SESSION']})"
+    if os.environ.get("TMUX"):
+        return "tmux"
+    return None
+
+
+def ensure_shell_block(sh: Shell) -> bool:
+    """Per-shell twin of ensure_block (ADR-3 law holds for every shell)."""
+    t = sh.rc_path()
+    if t.is_symlink():
+        t = t.resolve()
+    block = sh.block_text()
+    rx = block_re(sh.comment)
+    text = t.read_text() if t.exists() else None
+    if text is None:
+        t.parent.mkdir(parents=True, exist_ok=True)
+        t.write_text(f"{sh.comment} {t.name} — created by termi 💛 (your file; termi "
+                     f"only ever touches its marked block below)\n\n" + block + "\n")
+        return True
+    if f"{sh.comment} >>> termi >>>" in text:
+        new = rx.sub(lambda _m: block, text)
+        if new != text:
+            t.write_text(new)
+            return True
+        return False
+    sep = "" if text.endswith("\n") else "\n"
+    t.write_text(text + sep + "\n" + block + "\n")
+    return True
+
+
+def prepare_shell(sh: Shell) -> None:
+    """Block + dir + loader for any shell — the multi-shell prepare_zshd."""
+    ensure_shell_block(sh)
+    sh.dir.mkdir(parents=True, exist_ok=True)
+    sh.loader_path.write_text(sh.loader_body)
+
+
+def remove_shell_block(sh: Shell) -> bool:
+    t = sh.rc_path()
+    if t.is_symlink():
+        t = t.resolve()
+    if not t.exists():
+        return False
+    text = t.read_text()
+    new = block_re(sh.comment).sub("", text)
+    if new == text:
+        return False
+    t.write_text(new)
+    return True
+
+
+# ── voice ────────────────────────────────────────────────────────────────────
+def _tty() -> bool:
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+class C:
+    ok = "\033[32m" if _tty() else ""
+    warn = "\033[33m" if _tty() else ""
+    bad = "\033[31m" if _tty() else ""
+    dim = "\033[2m" if _tty() else ""
+    bold = "\033[1m" if _tty() else ""
+    cyan = "\033[36m" if _tty() else ""
+    off = "\033[0m" if _tty() else ""
+
+
+def say(msg: str) -> None:
+    print(msg)
+
+
+def whisper(msg: str) -> None:
+    print(f"{C.dim}{msg}{C.off}")
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"{C.bad}termi: {msg}{C.off}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ── lock (ORACLE P8) ─────────────────────────────────────────────────────────
+_lock_fh = None
+
+
+def acquire_lock() -> None:
+    global _lock_fh
+    if _lock_fh is not None:
+        return  # already held by this process — re-locking our own fd would fail
+    TERMI_DIR.mkdir(parents=True, exist_ok=True)
+    _lock_fh = open(TERMI_DIR / "lock", "w")
+    try:
+        fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_fh.write(str(os.getpid()))
+        _lock_fh.flush()
+    except BlockingIOError:
+        die("another termi is running — try again in a moment", 3)
+
+
+# ── zshrc & managed block (ORACLE ADR-3, P3, P4, P9) ─────────────────────────
+_warned_symlink = False
+
+
+def zshrc_target() -> Path:
+    """Real file behind ~/.zshrc; never replace a symlink (P3)."""
+    global _warned_symlink
+    if ZSHRC.is_symlink():
+        real = ZSHRC.resolve()
+        if not _warned_symlink:  # once, and to stderr — stdout may be a profile
+            print(
+                f"{C.warn}heads-up:{C.off} your .zshrc is a symlink → editing "
+                f"{real} (remember to commit it in your dotfiles repo)",
+                file=sys.stderr,
+            )
+            _warned_symlink = True
+        return real
+    return ZSHRC
+
+
+def read_zshrc() -> str | None:
+    t = zshrc_target()
+    return t.read_text() if t.exists() else None
+
+
+def ensure_block() -> bool:
+    """Insert/refresh the managed block. Returns True if the file changed."""
+    t = zshrc_target()
+    text = t.read_text() if t.exists() else None
+    if text is None:  # P4 — fresh machine, friendly birth
+        t.write_text(
+            "# ~/.zshrc — created by termi 💛 (your file; termi only ever "
+            "touches its marked block below)\n\n" + BLOCK + "\n"
+        )
+        return True
+    if MARK_BEGIN in text:
+        new = BLOCK_RE.sub(lambda _m: BLOCK, text)  # refresh in place (P9)
+        if new != text:
+            t.write_text(new)
+            return True
+        return False
+    sep = "" if text.endswith("\n") else "\n"
+    t.write_text(text + sep + "\n" + BLOCK + "\n")
+    return True
+
+
+def user_content_sha(text: str | None) -> str:
+    """Checksum of the user's zshrc minus our block — invariant I2's substrate."""
+    if text is None:
+        return "ABSENT"
+    return hashlib.sha256(BLOCK_RE.sub("", text).encode()).hexdigest()
+
+
+# ── snapshots & undo (ORACLE ADR-3, I3) ──────────────────────────────────────
+def snapshot(label: str, extra: "list[Path] | tuple" = ()) -> Path:
+    """Snapshot everything a command is about to touch. `extra` carries files
+    outside ~/.termi (e.g. an emulator config) so undo restores them too."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%S.%fZ")
+    d = SNAPS / ts
+    d.mkdir(parents=True)
+    manifest = {"ts": ts, "label": label, "argv": sys.argv[1:], "termi": VERSION}
+    text = read_zshrc()
+    if text is None:
+        (d / "ZSHRC_ABSENT").touch()
+    else:
+        (d / "zshrc").write_text(text)
+    manifest["zshrc_user_sha"] = user_content_sha(text)
+    if ZSHD.exists():
+        shutil.copytree(ZSHD, d / "zsh.d")
+    if STATE.exists():
+        shutil.copy2(STATE, d / "state.json")
+    # multi-shell surfaces (phase 2): every registered shell's rc, dir, loader
+    rcs: dict[str, str | None] = {}
+    dirs: list[str] = []
+    loaders: list[str] = []
+    for sid, sh in shells().items():
+        if sid != "zsh":  # zsh rides the legacy zshrc fields above
+            rc = sh.rc_path()
+            rc = rc.resolve() if rc.is_symlink() else rc
+            if rc.exists():
+                shutil.copy2(rc, d / f"rc-{sid}")
+                rcs[sid] = f"rc-{sid}"
+            else:
+                rcs[sid] = None
+        if sh.dir.exists() and sh.dir.name != "zsh.d":
+            shutil.copytree(sh.dir, d / sh.dir.name)
+            dirs.append(sh.dir.name)
+        if sh.loader_path.exists():
+            (d / "loaders").mkdir(exist_ok=True)
+            shutil.copy2(sh.loader_path, d / "loaders" / sh.loader_path.name)
+            loaders.append(sh.loader_path.name)
+    manifest["rcs"], manifest["dirs"], manifest["loaders"] = rcs, dirs, loaders
+    extras: dict[str, str | None] = {}
+    if extra:
+        (d / "extra").mkdir()
+        for n, path in enumerate(extra):
+            if path.exists():
+                shutil.copy2(path, d / "extra" / f"{n}")
+                extras[str(path)] = f"{n}"
+            else:
+                extras[str(path)] = None  # absent → undo deletes it again
+    manifest["extra"] = extras
+    (d / "manifest.json").write_text(json.dumps(manifest, indent=1))
+    return d
+
+
+def latest_snapshot() -> Path | None:
+    if not SNAPS.exists():
+        return None
+    live = [p for p in SNAPS.iterdir() if p.is_dir() and not p.name.endswith(".undone")]
+    return max(live, key=lambda p: p.name) if live else None
+
+
+def cmd_undo(_args) -> int:
+    acquire_lock()
+    snap = latest_snapshot()
+    if not snap:
+        say("nothing to undo — no snapshots yet.")
+        return 0
+    t = zshrc_target()
+    if (snap / "ZSHRC_ABSENT").exists():
+        t.unlink(missing_ok=True)
+    else:
+        t.write_text((snap / "zshrc").read_text())
+    if ZSHD.exists():
+        shutil.rmtree(ZSHD)
+    if (snap / "zsh.d").exists():
+        shutil.copytree(snap / "zsh.d", ZSHD)
+    STATE.unlink(missing_ok=True)
+    if (snap / "state.json").exists():
+        shutil.copy2(snap / "state.json", STATE)
+    man = json.loads((snap / "manifest.json").read_text())
+    reg = shells()
+    if "rcs" in man:  # phase-2 snapshots carry every shell's surfaces
+        for sid, stored in man["rcs"].items():
+            if sid not in reg:
+                continue
+            rc = reg[sid].rc_path()
+            rc = rc.resolve() if rc.is_symlink() else rc
+            if stored is None:
+                rc.unlink(missing_ok=True)
+            else:
+                rc.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(snap / stored, rc)
+        for sh in reg.values():
+            if sh.dir.name == "zsh.d":
+                continue
+            if sh.dir.exists():
+                shutil.rmtree(sh.dir)
+            if (snap / sh.dir.name).exists():
+                shutil.copytree(snap / sh.dir.name, sh.dir)
+            if sh.loader_path.name in man.get("loaders", []):
+                shutil.copy2(snap / "loaders" / sh.loader_path.name, sh.loader_path)
+            elif sh.id != "zsh":
+                sh.loader_path.unlink(missing_ok=True)
+    for path_s, stored in (man.get("extra") or {}).items():
+        path = Path(path_s)
+        if stored is None:
+            path.unlink(missing_ok=True)          # we created it → remove it
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(snap / "extra" / stored, path)
+    snap.rename(snap.with_name(snap.name + ".undone"))
+    label = json.loads((snap.with_name(snap.name + ".undone") / "manifest.json").read_text())["label"]
+    say(f"{C.ok}✓ restored{C.off} state from before “{label}” — run `exec zsh` to reload.")
+    return 0
+
+
+# ── state ────────────────────────────────────────────────────────────────────
+def load_state() -> dict:
+    if STATE.exists():
+        return json.loads(STATE.read_text())
+    return {"installed": {}}
+
+
+def save_state(st: dict) -> None:
+    TERMI_DIR.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(st, indent=1))
+
+
+# ── packs (ORACLE ADR-4) ─────────────────────────────────────────────────────
+class Item:
+    def __init__(self, pack: str, raw: dict):
+        self.pack = pack
+        self.name = raw["name"]
+        self.id = f"{pack}/{self.name}"
+        self.why = raw.get("why", "")
+        self.check = raw.get("check", f"command -v {self.name}")
+        self.active = raw.get("active")  # zsh probe; None → two-state item
+        self.brew = raw.get("brew")
+        self.apt = raw.get("apt")
+        self.snippet = raw.get("snippet")   # implicit zsh variant (back-compat)
+        self.post = raw.get("post")
+        self.order = int(raw.get("order", 50))
+        # per-shell variants (phase 2): [item.variants.<shell>] snippet/check/active
+        self.variants: dict[str, dict] = raw.get("variants", {})
+
+    def snippet_for(self, shell_id: str) -> str | None:
+        if shell_id == "zsh":
+            return self.snippet
+        return self.variants.get(shell_id, {}).get("snippet")
+
+
+def packs_dirs() -> list[Path]:
+    env = os.environ.get("TERMI_PACKS_DIR")
+    if env:  # hermetic override for tests
+        return [Path(env)]
+    here = Path(__file__).resolve().parent.parent / "packs"
+    dirs = [here, TERMI_DIR / "packs"]
+    return [d for d in dirs if d.is_dir()]
+
+
+def load_packs() -> dict[str, list[Item]]:
+    packs: dict[str, list[Item]] = {}
+    for d in packs_dirs():
+        for f in sorted(d.glob("*.toml")):
+            data = tomllib.loads(f.read_text())
+            name = data.get("pack", {}).get("name", f.stem)
+            packs[name] = [Item(name, raw) for raw in data.get("item", [])]
+    return packs
+
+
+def find_items(packs: dict[str, list[Item]], spec: str) -> list[Item]:
+    if "/" in spec:
+        pk, it = spec.split("/", 1)
+        got = [i for i in packs.get(pk, []) if i.name == it]
+    else:
+        got = packs.get(spec, [])
+    if not got:
+        die(f"no pack or item named “{spec}” — try `termi packs`")
+    return got
+
+
+# ── probing (ORACLE P7, P13) ─────────────────────────────────────────────────
+def check_installed(item: Item) -> bool:
+    r = subprocess.run(
+        ["sh", "-c", item.check], capture_output=True, timeout=10
+    )
+    return r.returncode == 0
+
+
+def probe_actives(items: list[Item]) -> dict[str, bool | None]:
+    """ONE interactive zsh answers every activation probe (P13: batch, timeout)."""
+    todo = [i for i in items if i.active]
+    if not todo:
+        return {}
+    lines = []
+    for i in todo:
+        lines.append(
+            f"if {i.active}; then print -r 'TERMIPROBE OK {i.id}'; "
+            f"else print -r 'TERMIPROBE NO {i.id}'; fi"
+        )
+    with tempfile.NamedTemporaryFile("w", suffix=".zsh", delete=False) as f:
+        f.write("\n".join(lines) + "\n")
+        script = f.name
+    result: dict[str, bool | None] = {i.id: None for i in todo}
+    try:
+        r = subprocess.run(
+            ["zsh", "-ic", f"source {script}"],
+            capture_output=True, text=True, timeout=25,
+        )
+        for line in r.stdout.splitlines():
+            m = re.match(r"TERMIPROBE (OK|NO) (.+)$", line.strip())
+            if m:
+                result[m.group(2)] = m.group(1) == "OK"
+    except subprocess.TimeoutExpired:
+        pass  # None values render as timeout
+    finally:
+        os.unlink(script)
+    return result
+
+
+def item_states(packs: dict[str, list[Item]]) -> dict[str, str]:
+    """id → missing | installed | active | timeout (the honesty core, P7).
+    The slow `zsh -ic` probe runs CONCURRENTLY with the per-item checks (P13):
+    probing a not-installed item is harmless (its result is simply unused)."""
+    from concurrent.futures import ThreadPoolExecutor
+    all_items = [i for items in packs.values() for i in items]
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        probing = ex.submit(probe_actives, [i for i in all_items if i.active])
+        installed = dict(zip((i.id for i in all_items),
+                             ex.map(check_installed, all_items)))
+        actives = probing.result()
+    states = {}
+    for i in all_items:
+        if not installed[i.id]:
+            states[i.id] = "missing"
+        elif i.active is None:
+            states[i.id] = "active"
+        elif actives.get(i.id) is None and i.id in actives:
+            states[i.id] = "timeout"
+        elif actives.get(i.id):
+            states[i.id] = "active"
+        else:
+            states[i.id] = "installed"
+    return states
+
+
+# ── doctor (F6 · I4) ─────────────────────────────────────────────────────────
+GLYPH_MARKS = {"active": f"{C.ok}✓{C.off}", "installed": f"{C.warn}◐{C.off}",
+               "missing": f"{C.dim}✗{C.off}", "timeout": f"{C.warn}⏱{C.off}"}
+STATE_WORD = {"active": "active", "installed": "installed, not active — reload? (exec zsh)",
+              "missing": "not installed", "timeout": "probe timed out"}
+
+
+def env_report() -> list[tuple[str, str, str]]:
+    rows = []
+    osname = platform.system()
+    if osname == "Linux" and Path("/proc/version").exists() and \
+            "microsoft" in Path("/proc/version").read_text().lower():
+        rows.append(("os", "ok", "Linux (WSL) — excellent choice 🐧"))
+    elif osname == "Darwin":
+        rows.append(("os", "ok", f"macOS {platform.mac_ver()[0]}"))
+    else:
+        rows.append(("os", "ok", osname))
+    shell = os.environ.get("SHELL", "")
+    if shell.endswith("zsh"):
+        rows.append(("shell", "ok", "zsh"))
+    else:  # P5 — print, never run
+        rows.append(("shell", "warn",
+                     f"{shell or 'unknown'} — switch with: chsh -s $(which zsh)"))
+    rows.append(("brew", "ok", "present") if shutil.which("brew")
+                else ("brew", "warn", "missing — see `termi install` prompts (P2)"))
+    rows.append(("python", "ok", platform.python_version()))
+    return rows
+
+
+def cmd_doctor(_args) -> int:
+    packs = load_packs()
+    say(f"{C.bold}termi doctor{C.off} 💛")
+    say(f"\n{C.cyan}environment{C.off}")
+    for name, level, detail in env_report():
+        mark = f"{C.ok}✓{C.off}" if level == "ok" else f"{C.warn}!{C.off}"
+        say(f"  {mark} {name:<10} {detail}")
+    states = item_states(packs)
+    bad = 0
+    for pack, items in packs.items():
+        say(f"\n{C.cyan}{pack}{C.off}")
+        for i in items:
+            st = states[i.id]
+            if st in ("installed", "timeout"):
+                bad += 1
+            say(f"  {GLYPH_MARKS[st]} {i.name:<22} {C.dim}{STATE_WORD[st]}{C.off}")
+    statusline_active = states.get("shell-qol/statusline") == "active"
+    if statusline_active:
+        whisper("\n  statusline is live — glyphs looking odd? run `termi fontcheck` (P6)")
+    n_active = sum(1 for s in states.values() if s == "active")
+    say(f"\n{n_active}/{len(states)} active"
+        + (f" · {C.warn}{bad} installed-but-not-active{C.off}" if bad else ""))
+    return 1 if bad else 0
+
+
+def cmd_fontcheck(_args) -> int:  # ORACLE P6
+    say("Look closely:          ← a branch, a fork, and a little house")
+    ans = input("Do those render as real symbols (not ? or boxes)? [y/N] ").strip().lower()
+    if ans == "y":
+        say(f"{C.ok}✓ Nerd Font is working.{C.off}")
+        return 0
+    say("Your terminal font is missing Nerd Font glyphs. Fix:")
+    say("  brew install --cask font-jetbrains-mono-nerd-font")
+    say("  then pick “JetBrainsMono Nerd Font” in your terminal's settings → font.")
+    return 1
+
+
+# ── install (F4/F6 · ORACLE P2, P7, P9, P10) ─────────────────────────────────
+def installer_cmd(item: Item) -> list[str] | None:
+    if platform.system() == "Darwin":
+        if item.brew:
+            return ["brew", "install", item.brew]
+        return None
+    if item.apt:
+        pre = [] if os.geteuid() == 0 else ["sudo"]
+        return pre + ["apt-get", "install", "-y", item.apt]
+    return None
+
+
+def snippet_path(item: Item) -> Path:
+    return ZSHD / f"{item.order:02d}-{item.name}.zsh"
+
+
+def snippet_body(item: Item) -> str:
+    return f"# {item.id} — managed by termi\n{item.snippet}\n"
+
+
+def snippet_stale(item: Item) -> bool:
+    """True only when TERMI installed this snippet and the pack has since changed.
+    An absent file means the item is active some other way (e.g. zinit) — leave it."""
+    p = snippet_path(item)
+    return bool(item.snippet) and p.exists() and p.read_text() != snippet_body(item)
+
+
+def prepare_zshd() -> None:
+    """The one gate every zsh.d write goes through — registry-defined loader."""
+    ensure_block()  # legacy zsh path keeps TERMI_ZSHRC test semantics
+    ZSHD.mkdir(parents=True, exist_ok=True)
+    LOADER.write_text(shells()["zsh"].loader_body)
+
+
+def write_snippet(item: Item) -> None:
+    prepare_zshd()
+    snippet_path(item).write_text(snippet_body(item))
+
+
+def write_variant_snippet(sh: Shell, item: Item) -> None:
+    """Install a per-shell variant snippet (phase 2) — same laws, any shell."""
+    prepare_shell(sh)
+    body = item.snippet_for(sh.id)
+    (sh.dir / f"{item.order:02d}-{item.name}{sh.ext}").write_text(
+        f"{sh.comment} {item.id} — managed by termi\n{body}\n")
+
+
+def cmd_install(args) -> int:
+    acquire_lock()
+    packs = load_packs()
+    items = find_items(packs, args.spec) if args.spec else \
+        [i for its in packs.values() for i in its]
+    target_shell = getattr(args, "shell", None)
+    if target_shell and target_shell != "zsh":  # variant install path (phase 2)
+        sh = shells().get(target_shell)
+        if not sh:
+            die(f"unknown shell “{target_shell}” — see support/shells.toml")
+        chosen = [i for i in items if i.snippet_for(sh.id)]
+        if not chosen:
+            die(f"no {sh.id} variant exists for “{args.spec}” yet — "
+                f"variants live in packs/*.toml under [item.variants.{sh.id}]")
+        snapshot(f"install {args.spec or 'setup'} --shell {sh.id}")
+        for item in chosen:
+            say(f"\n{C.bold}{item.name}{C.off} ({sh.id}) — {item.why}")
+            if not args.yes:
+                try:
+                    if input("  install/enable? [y/N] ").strip().lower() != "y":
+                        continue
+                except EOFError:
+                    continue
+            write_variant_snippet(sh, item)
+            say(f"  {C.ok}✓ installed{C.off} → {sh.dir.name}/")
+        say(f"\nrestart {sh.id} to activate — verify with `termi env --deep`.")
+        return 0
+    snapshot(f"install {args.spec or 'setup'}")
+    if shell_configured(shells()["zsh"]):
+        prepare_zshd()  # loader upgrades must propagate too (P23's cousin)
+    states = item_states({"selected": items})  # probe only what we're installing
+    st = load_state()
+    results: list[tuple[str, str]] = []
+    for item in items:
+        cur = states.get(item.id, "missing")
+        if cur == "active":
+            # upgrade path: a pack edit must still reach installed users —
+            # "already active" used to skip the rewrite forever (fixed 2026-07-13)
+            if snippet_stale(item):
+                write_snippet(item)
+                results.append((item.id, "snippet refreshed (pack updated) ✓"))
+            else:
+                results.append((item.id, "already active"))
+            continue
+        say(f"\n{C.bold}{item.name}{C.off} — {item.why}")
+        cmd = installer_cmd(item)
+        # An item with a snippet but no brew/apt is shell-native (keys, recover):
+        # nothing to download — the snippet IS the install. Only a package item
+        # with no installer for this OS is genuinely unavailable (P2).
+        needs_pkg = bool(item.brew or item.apt)
+        if cur == "missing" and needs_pkg and cmd is None:
+            results.append((item.id, "unavailable on this OS (no installer field)"))
+            say(f"  {C.warn}no installer for this OS — skipping honestly (P2){C.off}")
+            continue
+        if cur == "missing" and not needs_pkg and not item.snippet:
+            results.append((item.id, "nothing to install (no installer, no snippet)"))
+            continue
+        if not args.yes:
+            try:
+                ans = input(f"  install/enable? [y/N] ").strip().lower()
+            except EOFError:
+                ans = ""
+            if ans != "y":
+                results.append((item.id, "skipped by you"))
+                continue
+        if cur == "missing" and needs_pkg and cmd:
+            whisper(f"  $ {' '.join(cmd)}")
+            r = subprocess.run(cmd)
+            if r.returncode != 0:  # P10 — report, continue, never retry-loop
+                results.append((item.id, "install FAILED (see above)"))
+                continue
+        if item.snippet:
+            write_snippet(item)
+        st["installed"][item.id] = {
+            "ts": datetime.now(timezone.utc).isoformat(), "termi": VERSION}
+        save_state(st)
+        if item.post:
+            say(f"  {C.cyan}{item.post}{C.off}")
+        results.append((item.id, "installed ✓"))
+    say(f"\n{C.bold}results{C.off}")
+    for iid, res in results:
+        say(f"  {iid:<34} {res}")
+    if any("installed ✓" in r for _, r in results):
+        say(f"\nrun {C.bold}exec zsh{C.off} then {C.bold}termi doctor{C.off} "
+            "to see everything go green.")
+    return 1 if any("FAILED" in r for _, r in results) else 0
+
+
+def cmd_disable(args) -> int:
+    """Deactivate a termi-installed item (snippet removed; package untouched)."""
+    acquire_lock()
+    packs = load_packs()
+    items = find_items(packs, args.spec)
+    snapshot(f"disable {args.spec}")
+    st = load_state()
+    for item in items:
+        removed = False
+        for sh in shells().values():
+            p = sh.dir / f"{item.order:02d}-{item.name}{sh.ext}"
+            if p.exists():
+                p.unlink()
+                removed = True
+        st.get("installed", {}).pop(item.id, None)
+        say(f"  {item.id:<34} {'disabled ✓ (re-enable: termi enable ' + args.spec + ')' if removed else 'nothing to disable (no termi snippet)'}")
+    save_state(st)
+    say(f"\nrun {C.bold}exec $SHELL{C.off} to apply — `termi undo` reverts.")
+    return 0
+
+
+def cmd_packs(_args) -> int:
+    packs = load_packs()
+    for pack, items in packs.items():
+        say(f"{C.bold}{pack}{C.off}")
+        for i in items:
+            say(f"  {i.name:<22} {C.dim}{i.why}{C.off}")
+    say(f"\ninstall with: termi install <pack>  ·  termi install <pack>/<item>")
+    return 0
+
+
+# ── profile (F7/F8 · ORACLE ADR-2, P11, R1) ──────────────────────────────────
+PLUGIN_RE = re.compile(r"^\s*(zinit (?:light|load)|antigen bundle|zplug)\s+(\S+)",
+                       re.MULTILINE)
+
+
+def toml_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def cmd_export(args) -> int:
+    packs = load_packs()
+    states = item_states(packs)
+    text = read_zshrc() or ""
+    plugins = [m.group(2) for m in PLUGIN_RE.finditer(BLOCK_RE.sub("", text))]
+    out = [
+        "# termi profile — cherry-pick me with: termi import <this file>",
+        "[profile]",
+        f'created = "{datetime.now(timezone.utc).isoformat()}"',
+        f'os = "{platform.system()}"',
+        f'termi = "{VERSION}"',
+        "",
+    ]
+    for iid, stt in states.items():
+        if stt == "active":
+            out += ["[[tool]]", f'id = "{toml_escape(iid)}"', ""]
+    for p in plugins:
+        out += ["[[plugin]]", f'id = "{toml_escape(p)}"', ""]
+    if args.include_zshrc:
+        body = BLOCK_RE.sub("", text)
+        kept, dropped = [], 0
+        for line in body.splitlines():
+            if SECRET_RE.search(line):
+                dropped += 1
+            else:
+                kept.append(line)
+        if dropped:  # P11/R7 — secrets never travel; notice on stderr (stdout is the profile)
+            print(f"{C.warn}screened out {dropped} secret-looking line(s) — "
+                  f"they stay on this machine.{C.off}", file=sys.stderr)
+        out += ["[zshrc_extra]", 'content = """', *kept, '"""', ""]
+    payload = "\n".join(out)
+    if args.output:
+        Path(args.output).write_text(payload)
+        say(f"{C.ok}✓ profile written{C.off} → {args.output}")
+    else:
+        print(payload)
+    return 0
+
+
+def typed_yes(prompt: str) -> bool:
+    say(prompt)
+    try:
+        return input('  type "yes" to accept, anything else to skip: ').strip() == "yes"
+    except EOFError:
+        return False
+
+
+def cmd_import(args) -> int:
+    acquire_lock()
+    data = tomllib.loads(Path(args.file).read_text())
+    packs = load_packs()
+    known = {i.id: i for its in packs.values() for i in its}
+    snapshot(f"import {args.file}")
+    wanted = [t["id"] for t in data.get("tool", [])]
+    say(f"{C.bold}profile from {args.file}{C.off} — cherry-pick what you like:")
+    installable = [w for w in wanted if w in known]
+    unknown = [w for w in wanted if w not in known]
+    for w in installable:
+        say(f"  {C.ok}•{C.off} {w:<32} {C.dim}{known[w].why}{C.off}")
+    for w in unknown:
+        say(f"  {C.dim}• {w} — no pack knows this one (yet){C.off}")
+    plugins = [p["id"] for p in data.get("plugin", [])]
+    if plugins:
+        say(f"\n{C.warn}⚠ UNTRUSTED{C.off} — plugins are code that runs in your shell (R1):")
+        for p in plugins:
+            say(f"    zinit light {p}")
+        if typed_yes("  adopt these plugin lines?"):
+            prepare_zshd()
+            body = "\n".join(f"zinit light {p}" for p in plugins)
+            (ZSHD / "70-imported-plugins.zsh").write_text(
+                "# imported by termi — from " + args.file + "\n"
+                "command -v zinit >/dev/null 2>&1 || return 0\n" + body + "\n")
+            say(f"  {C.ok}✓ adopted{C.off} (loads only if zinit is present)")
+    extra = data.get("zshrc_extra", {}).get("content")
+    if extra:
+        say(f"\n{C.bad}{C.bold}⚠ UNTRUSTED SHELL CODE from the profile author (R1/P11):"
+            f"{C.off}\n{'-'*60}\n{extra}\n{'-'*60}")
+        if typed_yes("  run this in every future shell?"):
+            prepare_zshd()
+            (ZSHD / "90-imported-extra.zsh").write_text(
+                "# imported by termi — UNTRUSTED origin, you approved it\n" + extra + "\n")
+            say(f"  {C.ok}✓ adopted{C.off}")
+    if installable:
+        say(f"\nnow run: {C.bold}termi install{C.off} — or per item, e.g. "
+            f"`termi install {installable[0]}`")
+    return 0
+
+
+# ── env (phase 2 · F-universal: detect everything, overstate nothing) ────────
+def detect_terminal_id() -> str:
+    for t in load_support("terminal"):
+        if any(os.environ.get(v) for v in t.get("env_any", [])):
+            return t["id"]
+    prog = os.environ.get("TERM_PROGRAM", "")
+    for t in load_support("terminal"):
+        if t.get("term_program") and t["term_program"] == prog:
+            return t["id"]
+    return prog.lower() or os.environ.get("TERM", "unknown")
+
+
+def shell_configured(sh: Shell) -> bool:
+    t = sh.rc_path()
+    t = t.resolve() if t.is_symlink() else t
+    return t.exists() and f"{sh.comment} >>> termi >>>" in t.read_text()
+
+
+def probe_shell_active(sh: Shell) -> bool | None:
+    """Deep probe: does an interactive shell actually load termi? (TERMI_ACTIVE)"""
+    if not (sh.probe and sh.probe_echo):
+        return None
+    try:
+        r = subprocess.run([*sh.probe, sh.probe_echo], capture_output=True,
+                           text=True, timeout=20,
+                           env={**os.environ, "TERMI_ACTIVE": ""})
+        return f"TERMIA:{sh.id}" in r.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+def harness_detected(h: dict) -> bool:
+    return subprocess.run(["sh", "-c", h["detect"]], capture_output=True,
+                          timeout=10).returncode == 0
+
+
+def skill_installed_for(h: dict) -> bool:
+    return (Path(os.path.expanduser(h["skills_dir"])) / "termi" / "SKILL.md").exists()
+
+
+def gather_env(deep: bool = False) -> dict:
+    from concurrent.futures import ThreadPoolExecutor
+    reg = shells()
+    hars = load_support("harness")
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        present = dict(zip(reg, ex.map(shell_present, reg.values())))
+        hdet = dict(zip((h["id"] for h in hars), ex.map(harness_detected, hars)))
+        active = {}
+        if deep:
+            probeable = [sh for sh in reg.values()
+                         if present[sh.id] and shell_configured(sh)]
+            active = dict(zip((s.id for s in probeable),
+                              ex.map(probe_shell_active, probeable)))
+    cur_term = detect_terminal_id()
+    term_entry = next((t for t in load_support("terminal") if t["id"] == cur_term), None)
+    return {
+        "os": detect_os(),
+        "mux": detect_mux(),
+        "terminal": {"id": cur_term,
+                     "keys_status": (term_entry or {}).get("keys_status", "unknown")},
+        "current_shell": current_shell_id(),
+        "shells": {sid: {
+            "present": present[sid],
+            "configured": shell_configured(sh) if present[sid] else False,
+            **({"active": active[sid]} if sid in active else {}),
+            "features": sh.features, "notes": sh.notes,
+        } for sid, sh in reg.items()},
+        "harnesses": {h["id"]: {
+            "detected": hdet[h["id"]],
+            "skill_installed": skill_installed_for(h) if hdet[h["id"]] else False,
+            "dir_status": h.get("dir_status", "guessed"),
+        } for h in hars},
+    }
+
+
+FEAT_GLYPH = {"verified": f"{C.ok}●{C.off}", "native": f"{C.cyan}◆{C.off}",
+              "core": f"{C.warn}◐{C.off}", "planned": f"{C.dim}○{C.off}",
+              "untested": f"{C.dim}?{C.off}", "documented": f"{C.cyan}✎{C.off}",
+              "unsupported": f"{C.dim}✗{C.off}"}
+
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def padc(s: str, width: int) -> str:
+    """Pad to VISIBLE width — ANSI escapes are zero columns wide."""
+    return s + " " * max(0, width - len(ANSI_RE.sub("", s)))
+
+
+def one_liner(env: dict) -> str:
+    hs = [h for h, v in env["harnesses"].items() if v["detected"]] or ["your agent harness"]
+    return (f"🤖 agent one-liner: run `termi skill install` to add the 'termi' skill to "
+            f"{', '.join(hs)}, then activate it to set up and maintain this exact "
+            f"environment ({env['os']} · {env['current_shell']} · "
+            f"{env['terminal']['id']}{' · ' + env['mux'] if env['mux'] else ''}).")
+
+
+def cmd_env(args) -> int:
+    env = gather_env(deep=args.deep)
+    if args.json:
+        print(json.dumps(env, indent=1))
+        return 0
+    say(f"{C.bold}termi env{C.off} 💛  {C.dim}(● verified · ◆ native · ◐ core · "
+        f"○ planned · ✎ documented · ? untested){C.off}\n")
+    mux = f" · {env['mux']}" if env["mux"] else ""
+    say(f"  {C.cyan}{env['os']}{C.off} · terminal {C.cyan}{env['terminal']['id']}{C.off} "
+        f"(keys {FEAT_GLYPH.get(env['terminal']['keys_status'], env['terminal']['keys_status'])})"
+        f" · shell {C.cyan}{env['current_shell']}{C.off}{mux}\n")
+    feats = ["block", "recover", "keys", "jumpto", "packs"]
+    say(f"  {'shell':<12}{'here':<6}{'termi':<7}" + "".join(f"{f:<9}" for f in feats))
+    for sid, s in env["shells"].items():
+        here = f"{C.ok}yes{C.off}" if s["present"] else f"{C.dim}—{C.off}"
+        conf = ("—" if not s["present"] else
+                (f"{C.ok}on{C.off}" if s.get("active") else
+                 f"{C.warn}set{C.off}" if s["configured"] else f"{C.dim}off{C.off}"))
+        row = "".join(padc(FEAT_GLYPH.get(s["features"].get(f, "planned"), "?"), 9)
+                      for f in feats)
+        say(f"  {sid:<12}{padc(here, 6)}{padc(conf, 7)}{row}")
+    say("")
+    for hid, h in env["harnesses"].items():
+        if h["detected"]:
+            sk = f"{C.ok}skill installed{C.off}" if h["skill_installed"] else \
+                 f"{C.dim}skill not installed{C.off}"
+            say(f"  {C.cyan}⛭{C.off} {hid:<14}{sk}")
+    say(f"\n{one_liner(env)}")
+    if not args.deep:
+        whisper("  (`termi env --deep` also live-probes each configured shell)")
+    return 0
+
+
+def cmd_shells(args) -> int:
+    reg = shells()
+    if args.action in ("enable", "disable"):
+        sh = reg.get(args.shell or "")
+        if not sh:
+            die(f"unknown shell “{args.shell}” — see support/shells.toml (ADR-12)")
+        acquire_lock()
+        snapshot(f"shells {args.action} {sh.id}")
+        if args.action == "enable":
+            if not shell_present(sh):
+                die(f"{sh.id} isn't installed on this machine")
+            prepare_shell(sh)
+            say(f"{C.ok}✓ {sh.id} enabled{C.off} — managed block in {sh.rc_path()}, "
+                f"loader {sh.loader_path.name}. Restart {sh.id} to activate.")
+            if sh.notes:
+                whisper(f"  note: {sh.notes}")
+        else:
+            changed = remove_shell_block(sh)
+            sh.loader_path.unlink(missing_ok=True)
+            say(f"{C.ok}✓ {sh.id} disabled{C.off} — block removed "
+                f"{'' if changed else '(was not present)'}; snippets in "
+                f"{sh.dir.name}/ kept for re-enable. `termi undo` reverts.")
+        return 0
+    env = gather_env()
+    for sid, s in env["shells"].items():
+        state = ("not installed" if not s["present"] else
+                 "configured ✓" if s["configured"] else "present, not configured")
+        say(f"  {sid:<12}{state}")
+    say(f"\nenable one: {C.bold}termi shells enable <id>{C.off} · disable: "
+        f"{C.bold}termi shells disable <id>{C.off}")
+    return 0
+
+
+# ── skill (phase 2: termi installs ITSELF into every agent harness) ──────────
+def bundled_skill_dir() -> Path:
+    return Path(__file__).resolve().parent.parent / "skills" / "termi"
+
+
+def cmd_skill(args) -> int:
+    src = bundled_skill_dir()
+    if not (src / "SKILL.md").exists():
+        die("bundled skill missing — expected skills/termi/SKILL.md in the repo")
+    hars = load_support("harness")
+    if args.action == "status" or args.action is None:
+        say(f"{C.bold}termi skill{C.off} — one skill, every harness 💛\n")
+        for h in hars:
+            det = harness_detected(h)
+            inst = skill_installed_for(h)
+            state = (f"{C.ok}installed{C.off}" if inst else
+                     f"{C.warn}detected, skill not installed{C.off}" if det else
+                     f"{C.dim}not detected{C.off}")
+            guess = "" if h.get("dir_status") == "verified" else f" {C.dim}(dir: convention, unconfirmed){C.off}"
+            say(f"  {h['id']:<14}{state}{guess}")
+        say(f"\ninstall everywhere detected: {C.bold}termi skill install{C.off}")
+        return 0
+    # install
+    results = []
+    for h in hars:
+        if not harness_detected(h):
+            continue
+        dest = Path(os.path.expanduser(h["skills_dir"]))
+        if (h.get("dir_status") != "verified" and not dest.exists()
+                and not getattr(args, "force_dir", False)):
+            results.append((h["id"], "skipped — skills dir is a guess and doesn't exist "
+                                     f"({dest}); pass --force-dir to create it"))
+            continue
+        if not args.yes:
+            try:
+                ans = input(f"  install 'termi' skill into {h['id']} ({dest})? [y/N] ")
+            except EOFError:
+                ans = ""
+            if ans.strip().lower() != "y":
+                results.append((h["id"], "skipped by you"))
+                continue
+        target = dest / "termi"
+        dest.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(src, target)
+        results.append((h["id"], f"installed ✓ → {target}"))
+    say(f"\n{C.bold}results{C.off}")
+    for hid, res in results:
+        say(f"  {hid:<14}{res}")
+    if not results:
+        say("  no harnesses detected on this machine.")
+    return 0
+
+
+# ── keys (F16 · ORACLE ADR-9: bind the shell, CONFIGURE the emulator) ────────
+EMULATOR_TIPS = {
+    "iterm2": [
+        "Settings → Profiles → Keys → Left Option key: **Esc+**   (⌥←/→ start jumping words)",
+        "Settings → Pointer → tick **Option-click moves cursor**  (click to place the caret)",
+        "⌘←/⌘→: Keys → Key Mappings → add ⌘← “Send Escape Sequence” [H  and ⌘→ → [F",
+    ],
+    "terminal.app": [
+        "Settings → Profiles → Keyboard → tick **Use Option as Meta key**",
+        "⌥-click already moves the cursor here — try it now",
+        "⌘←/⌘→ can't be sent by Terminal.app; ⌃A / ⌃E are bound and do the same",
+    ],
+    "ghostty": [
+        "~/.config/ghostty/config →  macos-option-as-alt = true",
+        "click-to-move-cursor comes from shell integration (on by default)",
+    ],
+    "kitty": [
+        "~/.config/kitty/kitty.conf →  macos_option_as_alt yes",
+        "click-to-move-cursor comes from kitty's shell integration (on by default)",
+    ],
+    "wezterm": [
+        "~/.wezterm.lua →  send_composed_key_when_left_alt_is_pressed = false",
+        "wezterm has no built-in click-to-move-cursor action — word-jumps, ⌥⌫ and "
+        "⇧-select all still work; ⌃A/⌃E cover line ends",
+    ],
+    "alacritty": [
+        "alacritty.toml → [window]  option_as_alt = \"Both\"",
+        "alacritty has no click-to-move-cursor — ⌃A/⌃E and word-jumps still work",
+    ],
+    "vscode": [
+        "settings.json →  \"terminal.integrated.macOptionIsMeta\": true",
+    ],
+    "warp": [
+        "Warp uses its own editor keybindings — most ZLE bindings won't reach the shell",
+    ],
+}
+
+# Sequences we must NEVER rebind — they are plain keys; if your terminal sends one
+# of these for a modified key, the terminal is misconfigured (ORACLE P14).
+FORBIDDEN_SEQS = {
+    b"\x7f", b"\x08", b"\r", b"\n", b"\t", b"\x03", b"\x04", b" ",
+    b"\x1b[A", b"\x1b[B", b"\x1b[C", b"\x1b[D",
+    b"\x1bOA", b"\x1bOB", b"\x1bOC", b"\x1bOD",
+}
+
+PROBE_ACTIONS = [
+    ("jump one word LEFT", "hold ⌥ (Alt) and press ←", "backward-word"),
+    ("jump one word RIGHT", "hold ⌥ (Alt) and press →", "forward-word"),
+    ("go to START of line", "press ⌘← (or Home, or fn+←)", "beginning-of-line"),
+    ("go to END of line", "press ⌘→ (or End, or fn+→)", "end-of-line"),
+    ("delete the word behind", "hold ⌥ and press ⌫", "backward-kill-word"),
+    ("delete to line start", "press ⌘⌫", "backward-kill-line"),
+    ("SELECT one char left", "hold ⇧ and press ←", "_termi_sel_backward_char"),
+    ("SELECT one word left", "hold ⇧⌥ and press ←", "_termi_sel_backward_word"),
+]
+
+
+# The line-motion keys the shell ALREADY listens for (from packs/keys.toml):
+#   \e[H → beginning-of-line · \e[F → end-of-line · \x15 → backward-kill-line
+#   \e[1;2H / \e[1;2F → select to line start / end
+# ⌘-arrows send NOTHING by default in most emulators, so the emulator must be
+# taught to emit those. That is what `termi keys apply` writes (ADR-10).
+LUA_BLOCK = """-- >>> termi >>>  (managed by termi — `termi undo` reverts)
+config.send_composed_key_when_left_alt_is_pressed = false  -- ⌥ = word jumps
+do
+  local act = require('wezterm').action
+  config.keys = config.keys or {}
+  for _, k in ipairs({
+    { key = 'LeftArrow',  mods = 'CMD',       action = act.SendString('\\x1b[H') },
+    { key = 'RightArrow', mods = 'CMD',       action = act.SendString('\\x1b[F') },
+    { key = 'Backspace',  mods = 'CMD',       action = act.SendString('\\x15') },
+    { key = 'LeftArrow',  mods = 'SHIFT|CMD', action = act.SendString('\\x1b[1;2H') },
+    { key = 'RightArrow', mods = 'SHIFT|CMD', action = act.SendString('\\x1b[1;2F') },
+    -- ⌘⌥←/→ → jumpto mode (CSI mod 7 = what ⌃⌥ sends elsewhere)
+    { key = 'LeftArrow',  mods = 'CMD|ALT',   action = act.SendString('\\x1b[1;7D') },
+    { key = 'RightArrow', mods = 'CMD|ALT',   action = act.SendString('\\x1b[1;7C') },
+  }) do table.insert(config.keys, k) end
+end
+-- <<< termi <<<"""
+
+KITTY_BLOCK = """# >>> termi >>>  (managed by termi — `termi undo` reverts)
+macos_option_as_alt yes
+map cmd+left        send_text all \\x1b[H
+map cmd+right       send_text all \\x1b[F
+map cmd+backspace   send_text all \\x15
+map shift+cmd+left  send_text all \\x1b[1;2H
+map shift+cmd+right send_text all \\x1b[1;2F
+map cmd+alt+left    send_text all \\x1b[1;7D
+map cmd+alt+right   send_text all \\x1b[1;7C
+# <<< termi <<<"""
+
+GHOSTTY_BLOCK = """# >>> termi >>>  (managed by termi — `termi undo` reverts)
+macos-option-as-alt = true
+keybind = cmd+left=text:\\x1b[H
+keybind = cmd+right=text:\\x1b[F
+keybind = cmd+backspace=text:\\x15
+keybind = shift+cmd+left=text:\\x1b[1;2H
+keybind = shift+cmd+right=text:\\x1b[1;2F
+keybind = cmd+alt+left=text:\\x1b[1;7D
+keybind = cmd+alt+right=text:\\x1b[1;7C
+# <<< termi <<<"""
+
+# emulator → (config path, managed block, comment marker prefix)
+EMULATOR_CONFIG = {
+    "wezterm": (Path.home() / ".wezterm.lua", LUA_BLOCK, "--"),
+    "kitty": (Path.home() / ".config/kitty/kitty.conf", KITTY_BLOCK, "#"),
+    "ghostty": (Path.home() / ".config/ghostty/config", GHOSTTY_BLOCK, "#"),
+}
+
+WEZTERM_FRESH = """-- wezterm config — created by termi 💛
+-- This is YOUR file. termi only ever touches the marked block below.
+local wezterm = require 'wezterm'
+local config = wezterm.config_builder()
+
+{block}
+
+return config
+"""
+
+# Terminals whose settings live in a GUI/plist — termi will NOT poke those.
+GUI_ONLY = {
+    "iterm2": "Settings → Keys → Key Bindings → + :  ⌘←  “Send Escape Sequence”  [H "
+              "· ⌘→ → [F   (and Profiles → Keys → Left Option = Esc+)",
+    "terminal.app": "Settings → Profiles → Keyboard → + :  ⌘←  “Send Text”  \\033[H "
+                    "· ⌘→ → \\033[F   (and tick “Use Option as Meta key”)",
+    "alacritty": "alacritty.toml → [[keyboard.bindings]] key=\"Left\" mods=\"Command\" "
+                 "chars=\"\\u001b[H\"  (and the same for Right → \\u001b[F)",
+    "vscode": "keybindings.json → bind cmd+left to workbench.action.terminal.sendSequence "
+              "with args {\"text\": \"\\u001b[H\"}",
+}
+
+
+def detect_emulator() -> str:
+    e = os.environ
+    if e.get("KITTY_WINDOW_ID"):
+        return "kitty"
+    if e.get("WEZTERM_PANE"):
+        return "wezterm"
+    if e.get("GHOSTTY_RESOURCES_DIR") or e.get("GHOSTTY_BIN_DIR"):
+        return "ghostty"
+    if e.get("ALACRITTY_WINDOW_ID") or e.get("ALACRITTY_SOCKET"):
+        return "alacritty"
+    prog = e.get("TERM_PROGRAM", "")
+    return {"iTerm.app": "iterm2", "Apple_Terminal": "terminal.app",
+            "vscode": "vscode", "WarpTerminal": "warp"}.get(
+        prog, prog.lower() or e.get("TERM", "unknown"))
+
+
+def zsh_quote_seq(seq: bytes) -> str:
+    """bytes → a zsh $'…' literal that bindkey accepts verbatim."""
+    out = ""
+    for b in seq:
+        if b == 0x1B:
+            out += "\\e"
+        elif b < 0x20 or b == 0x7F:
+            out += "\\x%02x" % b
+        elif chr(b) in "\\'":
+            out += "\\" + chr(b)
+        else:
+            out += chr(b)
+    return "$'" + out + "'"
+
+
+def learnable(seq: bytes) -> bool:
+    """Refuse to bind a plain key (that's how you break ← and ⌫)."""
+    if not seq or seq in FORBIDDEN_SEQS:
+        return False
+    return seq[0] == 0x1B or seq[0] < 0x20  # escape seq or control byte only
+
+
+def read_keyseq(timeout: float = 20.0) -> bytes:
+    """Raw-read one keypress, burst-drained. Enter = skip, ⌃C = abort."""
+    import select as sel
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        if not sel.select([fd], [], [], timeout)[0]:
+            return b""
+        buf = os.read(fd, 1)
+        while sel.select([fd], [], [], 0.08)[0]:
+            buf += os.read(fd, 1)
+        return buf
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def wezterm_stale(cfg: Path) -> bool:
+    """True when the RUNNING wezterm predates the config file — it launched with
+    no config, isn't watching the path, and will never load it without a restart
+    (live root cause 2026-07-13: bindings verified by parser, dead in practice)."""
+    try:
+        # ps, not pgrep — pgrep is blind inside some sandboxes where ps still works
+        out = subprocess.run(["ps", "-axo", "lstart=,comm="], capture_output=True,
+                             text=True, timeout=5).stdout
+        starts = [" ".join(ln.split()[:5]) for ln in out.splitlines()
+                  if ln.rstrip().endswith("wezterm-gui")]
+        if not starts:
+            return False
+        newest = max(datetime.strptime(s, "%a %b %d %H:%M:%S %Y") for s in starts)
+        return cfg.stat().st_mtime > newest.timestamp()
+    except Exception:
+        return False  # can't tell → don't cry wolf
+
+
+def emulator_block_applied(emu: str) -> bool:
+    entry = EMULATOR_CONFIG.get(emu)
+    if not entry:
+        return False
+    path, _, marker = entry
+    return path.exists() and f"{marker} >>> termi >>>" in path.read_text()
+
+
+def cmd_keys_apply(emu: str) -> int:
+    """Teach the EMULATOR to send ⌘←/⌘→ (ADR-10). Managed block, snapshot, undo."""
+    if emu in GUI_ONLY:
+        say(f"{C.warn}{emu} keeps its keys in a GUI/plist — termi won't poke that.{C.off}")
+        say(f"  do this once:\n    {GUI_ONLY[emu]}")
+        say(f"\n  the shell side is already listening — once your terminal sends "
+            f"\\e[H / \\e[F, ⌘←/⌘→ will jump to line start/end.")
+        return 0
+    entry = EMULATOR_CONFIG.get(emu)
+    if not entry:
+        die(f"no emulator config writer for “{emu}” — run `termi keys` for manual steps")
+    path, block, marker = entry
+    acquire_lock()
+    snapshot(f"keys apply ({emu})", extra=[path])
+    if not path.exists():
+        if emu != "wezterm":
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(block + "\n")
+        else:
+            path.write_text(WEZTERM_FRESH.format(block=block))
+        say(f"{C.ok}✓ created{C.off} {path} (termi's block only — everything else default)")
+    else:
+        text = path.read_text()
+        rx = block_re(marker)
+        if rx.search(text):
+            # lambda, NOT the string: the block contains \x1b, which re.sub would
+            # try to interpret as a regex escape and blow up (P9 idempotent path).
+            new = rx.sub(lambda _m: block, text)
+        elif emu == "wezterm":
+            # must land BEFORE `return <config>` or it's dead code — and before
+            # the LAST return: an early `return x` inside a helper function
+            # would put our block mid-function and corrupt the lua
+            matches = list(re.finditer(r"^(\s*)return\s+(\w+)\s*$", text, re.MULTILINE))
+            m = matches[-1] if matches else None
+            if not m:
+                say(f"{C.warn}couldn't find a `return <config>` line in {path}.{C.off}")
+                say("paste this block yourself, just above your return line:\n")
+                say(block)
+                return 1
+            var = m.group(2)
+            blk = block.replace("config.", f"{var}.")
+            new = text[:m.start()] + blk + "\n\n" + text[m.start():]
+        else:
+            sep = "" if text.endswith("\n") else "\n"
+            new = text + sep + "\n" + block + "\n"
+        if new == text:
+            say(f"{C.ok}✓ already applied{C.off} — {path} unchanged")
+            if emu == "wezterm" and wezterm_stale(path):
+                say(f"  {C.warn}⚠ the RUNNING WezTerm predates this config — if keys are "
+                    f"still dead, press ⌃⇧R in WezTerm to reload it (no restart).{C.off}")
+            return 0
+        path.write_text(new)
+        say(f"{C.ok}✓ patched{C.off} {path} (only inside termi's markers)")
+    if emu == "wezterm" and wezterm_stale(path):
+        say(f"\n  {C.warn}⚠ the RUNNING WezTerm launched before this config existed — "
+            f"it is not watching the file.{C.off}")
+        say(f"  Press {C.bold}⌃⇧R{C.off} in WezTerm (stock ReloadConfiguration) — "
+            f"no restart needed.")
+    else:
+        say(f"\n  now RESTART {emu} (a new tab isn't enough — it reloads config on launch),")
+    say(f"  then press ⌘← / ⌘→ on a line of text. Wrong? {C.bold}termi undo{C.off}.")
+    return 0
+
+
+def cmd_keys(args) -> int:
+    emu = detect_emulator()
+    if getattr(args, "action", None) == "apply":
+        return cmd_keys_apply(emu)
+    if getattr(args, "action", None) != "probe":
+        say(f"{C.bold}termi keys{C.off} — your shell, editing like a real app 💛\n")
+        say(f"  terminal: {C.cyan}{emu}{C.off}"
+            + (f" {C.dim}(inside tmux){C.off}" if os.environ.get("TMUX") else ""))
+        installed = (ZSHD / "50-editor-keys.zsh").exists()
+        learned = (ZSHD / "86-keys-learned.zsh").exists()
+        say(f"  bindings: {'installed' if installed else 'NOT installed'}"
+            f"{'  · learned overrides present' if learned else ''}")
+        jt = (ZSHD / "52-jumpto.zsh").exists()
+        say(f"  jumpto:   {'installed (experimental — TERMI_JUMPTO=0 disables)' if jt else 'not installed — termi install jumpto'}")
+        if not installed:
+            say(f"\n  get them:  {C.bold}termi install keys{C.off}")
+        if emu in EMULATOR_CONFIG:
+            applied = emulator_block_applied(emu)
+            path = EMULATOR_CONFIG[emu][0]
+            say(f"  ⌘←/⌘→:   {'configured in ' + str(path) if applied else 'NOT configured'}")
+            if applied and emu == "wezterm" and wezterm_stale(path):
+                say(f"  {C.warn}⚠ the RUNNING WezTerm started before this config was "
+                    f"written — if you haven't reloaded since, it isn't live.{C.off}")
+                say(f"    Press {C.bold}⌃⇧R{C.off} in WezTerm (stock ReloadConfiguration — "
+                    f"no restart needed),")
+                say(f"    then `termi keys probe` and press ⌘← — expect $'\\e[H'.")
+            if not applied:
+                say(f"\n  {C.bold}termi keys apply{C.off} — teaches {emu} to send ⌘←/⌘→ "
+                    f"(line start/end), ⌘⌫, and ⇧⌘←/→ to select. Snapshot + undo, "
+                    f"as always.")
+        say(f"\n{C.cyan}the emulator half:{C.off}")
+        tips = EMULATOR_TIPS.get(emu)
+        if tips:
+            for t in tips:
+                say(f"  • {t}")
+        if emu in GUI_ONLY:
+            say(f"  • ⌘←/⌘→ (GUI setting — termi won't poke a plist):\n      {GUI_ONLY[emu]}")
+        if not tips and emu not in GUI_ONLY:
+            say(f"  {C.dim}no tips on file for “{emu}” — look for an "
+                f"“option/alt sends escape” setting, and a click-to-move-cursor one.{C.off}")
+        if os.environ.get("TMUX"):
+            say(f"  • tmux: add {C.bold}set -g xterm-keys on{C.off} to ~/.tmux.conf "
+                "or modified arrows get swallowed")
+        say(f"\n  keys not working after all that? {C.bold}termi keys probe{C.off} "
+            "— it learns what your terminal actually sends.")
+        return 0
+
+    # ── probe: learn this terminal's REAL sequences ──────────────────────
+    if not sys.stdin.isatty():
+        die("`termi keys probe` needs a real terminal (it reads raw keypresses)")
+    acquire_lock()
+    say(f"{C.bold}termi keys probe{C.off} — press each combo; termi records exactly "
+        f"what your terminal sends.")
+    say(f"{C.dim}Enter = skip this one · ⌃C = stop{C.off}\n")
+    learned: list[tuple[str, bytes, str]] = []
+    seen: dict[bytes, str] = {}
+    for label, how, widget in PROBE_ACTIONS:
+        sys.stdout.write(f"  {label:<24} {C.dim}{how}{C.off} … ")
+        sys.stdout.flush()
+        seq = read_keyseq()
+        if seq == b"\x03":
+            say("\n  stopped.")
+            break
+        if seq in (b"\r", b"\n", b""):
+            say(f"{C.dim}skipped{C.off}")
+            continue
+        pretty = zsh_quote_seq(seq)
+        if not learnable(seq):
+            say(f"{C.bad}{pretty} — that's a PLAIN key{C.off}")
+            say(f"    {C.warn}your terminal isn't sending a distinct code for that "
+                f"combo — fix it in the emulator (run `termi keys`), not here.{C.off}")
+            continue
+        if seq in seen:
+            say(f"{C.bad}{pretty} — same as “{seen[seq]}”{C.off}")
+            say(f"    {C.warn}two combos can't share one code — skipping both.{C.off}")
+            learned = [x for x in learned if x[1] != seq]
+            continue
+        seen[seq] = label
+        learned.append((label, seq, widget))
+        say(f"{C.ok}{pretty}{C.off}")
+    if not learned:
+        say("\nnothing learned — no changes made.")
+        return 0
+    snapshot("keys probe")
+    prepare_zshd()
+    lines = ["# learned by `termi keys probe` — what YOUR terminal actually sends.",
+             "# loads after 50-editor-keys.zsh, so these win. `termi undo` removes them.",
+             ""]
+    for label, seq, widget in learned:
+        lines.append(f"bindkey {zsh_quote_seq(seq)} {widget}   # {label}")
+    (ZSHD / "86-keys-learned.zsh").write_text("\n".join(lines) + "\n")
+    say(f"\n{C.ok}✓ learned {len(learned)} binding(s){C.off} → ~/.termi/zsh.d/86-keys-learned.zsh")
+    say(f"  run {C.bold}exec zsh{C.off} and try them. Wrong? {C.bold}termi undo{C.off}.")
+    return 0
+
+
+# ── recover (F2 · ORACLE ADR-8: suggest + preload, NEVER auto-run) ───────────
+def osa_distance(a: str, b: str, cap: int = 2) -> int:
+    """Optimal-string-alignment distance — catches transpositions (gti→git),
+    which difflib structurally misses (field log 2026-07-06)."""
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    prev2, prev, cur = None, list(range(len(b) + 1)), None
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if i > 1 and j > 1 and ca == b[j - 2] and a[i - 2] == cb:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        prev2, prev = prev, cur
+    return prev[len(b)]
+
+
+def path_commands() -> set[str]:
+    names: set[str] = set()
+    for d in os.environ.get("PATH", "").split(":"):
+        try:
+            names.update(os.listdir(d or "."))
+        except OSError:
+            continue
+    return names
+
+
+def cmd_suggest(args) -> int:
+    import difflib
+    typo = args.typo
+    names = path_commands()
+    if typo in names:  # not actually a typo
+        return 1
+    # rank: distance, then same-length first (a transposition like gti→git
+    # is a likelier typo than a deletion like gti→ti — learned live, field log)
+    near = [(osa_distance(typo, n, 1), abs(len(n) - len(typo)), n) for n in names
+            if abs(len(n) - len(typo)) <= 1]
+    hits = sorted(h for h in near if h[0] <= 1)
+    if hits:
+        print(hits[0][2])
+        return 0
+    best = difflib.get_close_matches(typo, names, n=1, cutoff=0.75)
+    if best:
+        print(best[0])
+        return 0
+    return 1
+
+
+# ── tui v2 (F14 — the control center: see everything, toggle anything) ───────
+def _tui_rows(packs, states) -> list:
+    """(kind, payload) rows: pack headers + toggleable items + shell rows."""
+    rows = []
+    for pack, items in packs.items():
+        rows.append(("header", pack))
+        for i in items:
+            rows.append(("item", i))
+    rows.append(("header", "shells"))
+    for sh in shells().values():
+        rows.append(("shell", sh))
+    return rows
+
+
+def _tui_key(fd, timeout: float = 300.0) -> bytes:
+    """Read ONE key, CSI-aware — assumes the tty is ALREADY raw (the TUI owns raw
+    mode for its lifetime). A fixed burst window is a race: under load an arrow's
+    3 bytes split past it, a lone ESC desyncs the stream, and the eventual 'q'
+    gets eaten mid-sequence (P21's failure mode). Parse the sequence instead."""
+    import select as sel
+    if not sel.select([fd], [], [], timeout)[0]:
+        return b""
+    buf = os.read(fd, 1)
+    if buf != b"\x1b":
+        return buf
+    if not sel.select([fd], [], [], 0.2)[0]:
+        return buf                      # a real, lone Escape keypress
+    buf += os.read(fd, 1)
+    if buf[1:2] in (b"[", b"O"):        # CSI/SS3 — read to the final byte
+        while sel.select([fd], [], [], 0.2)[0]:
+            c = os.read(fd, 1)
+            buf += c
+            if 0x40 <= c[0] <= 0x7E or len(buf) > 16:
+                break
+    return buf
+
+
+def cmd_tui(_args) -> int:
+    if not sys.stdin.isatty():
+        # headless fallback: everything the TUI shows, as plain text (I2)
+        cmd_env(argparse.Namespace(json=False, deep=False))
+        say("")
+        return cmd_packs(None)
+    packs = load_packs()
+    say(f"{C.dim}termi 💛 gathering live state…{C.off}")
+    states = item_states(packs)
+    shell_conf = {sid: shell_configured(sh) for sid, sh in shells().items()}
+    shell_here = {sid: shell_present(sh) for sid, sh in shells().items()}
+    rows = _tui_rows(packs, states)
+    sel = next(i for i, r in enumerate(rows) if r[0] != "header")
+    msg = "↑↓ move · ↵/space toggle · d doctor · e env · k keys · u undo · q quit"
+    import termios
+    import tty as _tty
+    fd = sys.stdin.fileno()
+    saved_tty = termios.tcgetattr(fd)
+    _tty.setraw(fd)
+
+    def cooked():
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved_tty)
+
+    def raw():
+        _tty.setraw(fd)
+
+    sys.stdout.write("\033[?25l")  # hide cursor; no clear-scroll (BUDGETS: no flicker)
+    try:
+        while True:
+            out = [f"\033[H\033[J{C.bold}termi{C.off} — your Terminal Friend 💛   "
+                   f"{C.dim}the control center{C.off}\n"]
+            for n, (kind, val) in enumerate(rows):
+                cur = n == sel
+                pre = f"{C.cyan}▸{C.off} " if cur else "  "
+                if kind == "header":
+                    out.append(f"\n  {C.cyan}{val}{C.off}")
+                elif kind == "item":
+                    stt = states.get(val.id, "missing")
+                    mark = GLYPH_MARKS.get(stt, "?")
+                    line = f"{pre}{mark} {val.name:<22}{C.dim}{STATE_WORD[stt]}{C.off}"
+                    out.append("  " + (f"\033[7m{ANSI_RE.sub('', line)}\033[0m" if cur else line))
+                else:  # shell
+                    state = ("configured ✓" if shell_conf[val.id] else
+                             "present" if shell_here[val.id] else "not installed")
+                    line = f"{pre}⌂ {val.id:<22}{C.dim}{state}{C.off}"
+                    out.append("  " + (f"\033[7m{ANSI_RE.sub('', line)}\033[0m" if cur else line))
+            out.append(f"\n\n  {C.dim}{msg}{C.off}\n")
+            sys.stdout.write("\r\n".join(x.replace("\n", "\r\n") for x in out))
+            sys.stdout.flush()
+            key = _tui_key(fd)
+            msg = "↑↓ move · ↵/space toggle · d doctor · e env · k keys · u undo · q quit"
+            if key in (b"q", b"Q", b"\x03", b""):
+                return 0
+            if key in (b"\x1b[A", b"k_up") or key == b"\x1b[A":
+                sel = max(0, sel - 1)
+                while rows[sel][0] == "header" and sel > 0:
+                    sel -= 1
+                if rows[sel][0] == "header":
+                    sel += 1
+            elif key == b"\x1b[B":
+                sel = min(len(rows) - 1, sel + 1)
+                while sel < len(rows) - 1 and rows[sel][0] == "header":
+                    sel += 1
+            elif key in (b"\r", b"\n", b" "):
+                kind, val = rows[sel]
+                cooked()
+                sys.stdout.write("\033[?25h\033[H\033[J")
+                sys.stdout.flush()
+                if kind == "item":
+                    stt = states.get(val.id, "missing")
+                    ns = argparse.Namespace(yes=False, shell=None,
+                                            spec=f"{val.pack}/{val.name}")
+                    if stt == "active" and any(
+                            (s.dir / f"{val.order:02d}-{val.name}{s.ext}").exists()
+                            for s in shells().values()):
+                        cmd_disable(ns)
+                    else:
+                        cmd_install(ns)
+                    states = item_states(packs)
+                else:
+                    ns = argparse.Namespace(
+                        action="disable" if shell_conf[val.id] else "enable",
+                        shell=val.id)
+                    cmd_shells(ns)
+                    shell_conf[val.id] = shell_configured(val)
+                input(f"\n{C.dim}press ↵ to return to the control center{C.off}")
+                raw()
+                sys.stdout.write("\033[?25l")
+            elif key in (b"d", b"e", b"k", b"u"):
+                cooked()
+                sys.stdout.write("\033[?25h\033[H\033[J")
+                sys.stdout.flush()
+                {b"d": lambda: cmd_doctor(None),
+                 b"e": lambda: cmd_env(argparse.Namespace(json=False, deep=False)),
+                 b"k": lambda: cmd_keys(argparse.Namespace(action=None)),
+                 b"u": lambda: cmd_undo(None)}[key]()
+                input(f"\n{C.dim}press ↵ to return to the control center{C.off}")
+                raw()
+                sys.stdout.write("\033[?25l")
+                if key == b"u":
+                    states = item_states(packs)
+                    shell_conf = {sid: shell_configured(s) for sid, s in shells().items()}
+    finally:
+        cooked()
+        sys.stdout.write("\033[?25h\r\n")
+        sys.stdout.flush()
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="termi", description="termi — your Terminal Friend 💛")
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("doctor", help="diagnose your terminal (exit 0 = all green)")
+    sub.add_parser("packs", help="list everything termi can set up")
+    p = sub.add_parser("install", help="install a pack or item (consent per item)")
+    p.add_argument("spec", nargs="?", help="<pack> or <pack>/<item>; empty = full setup")
+    p.add_argument("--yes", action="store_true", help="skip prompts (automation)")
+    p.add_argument("--shell", help="install this shell's variant (e.g. bash, powershell)")
+    dis = sub.add_parser("disable", help="deactivate an installed item (snippet removed, package kept)")
+    dis.add_argument("spec", help="<pack> or <pack>/<item>")
+    en = sub.add_parser("enable", help="re-activate a disabled item")
+    en.add_argument("spec")
+    sub.add_parser("undo", help="restore the snapshot taken before the last change")
+    sub.add_parser("fontcheck", help="verify Nerd Font glyphs render")
+    e = sub.add_parser("export", help="export your setup as a shareable profile")
+    e.add_argument("-o", "--output", help="write to file (default: stdout)")
+    e.add_argument("--include-zshrc", action="store_true",
+                   help="embed your zshrc (secret-screened)")
+    i = sub.add_parser("import", help="cherry-pick from someone's profile")
+    i.add_argument("file")
+    ev = sub.add_parser("env", help="detect OS/shells/terminal/mux/harnesses + coverage matrix")
+    ev.add_argument("--json", action="store_true", help="machine-readable output")
+    ev.add_argument("--deep", action="store_true",
+                    help="also live-probe each configured shell's activation")
+    sh = sub.add_parser("shells", help="list/enable/disable termi per shell")
+    sh.add_argument("action", nargs="?", choices=["enable", "disable"])
+    sh.add_argument("shell", nargs="?", help="shell id from support/shells.toml")
+    sk = sub.add_parser("skill", help="install the termi agent skill into detected harnesses")
+    sk.add_argument("action", nargs="?", choices=["install", "status"])
+    sk.add_argument("--yes", action="store_true", help="skip prompts")
+    sk.add_argument("--force-dir", action="store_true",
+                    help="create a guessed skills dir if it doesn't exist")
+    k = sub.add_parser("keys", help="editor-style keys + your terminal's own settings")
+    k.add_argument("action", nargs="?", choices=["probe", "apply"],
+                   help="apply: configure your terminal (⌘←/⌘→) · "
+                        "probe: learn what YOUR terminal actually sends")
+    sub.add_parser("tui", help="interactive menu")
+    sub.add_parser("version", help="print version")
+    s = sub.add_parser("_suggest")  # internal: recover pack's typo matcher
+    s.add_argument("typo")
+    args = ap.parse_args()
+    if args.cmd == "version":
+        print(f"termi {VERSION}")
+        return 0
+    handlers = {"doctor": cmd_doctor, "packs": cmd_packs, "install": cmd_install,
+                "undo": cmd_undo, "fontcheck": cmd_fontcheck, "export": cmd_export,
+                "import": cmd_import, "tui": cmd_tui, "keys": cmd_keys,
+                "env": cmd_env, "shells": cmd_shells, "skill": cmd_skill,
+                "disable": cmd_disable,
+                "enable": lambda a: cmd_install(argparse.Namespace(
+                    spec=a.spec, yes=True, shell=None)),
+                "_suggest": cmd_suggest}
+    if args.cmd is None:
+        return cmd_tui(None)
+    return handlers[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

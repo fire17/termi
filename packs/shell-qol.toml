@@ -1,0 +1,54 @@
+# shell-qol — the four upgrades every zsh deserves
+[pack]
+name = "shell-qol"
+
+[[item]]
+name = "fzf"
+why = "fuzzy-find everything — Ctrl-R history, Ctrl-T files, ** completion"
+check = "command -v fzf"
+active = "(( $+widgets[fzf-history-widget] ))"
+brew = "fzf"
+apt = "fzf"
+snippet = '''command -v fzf >/dev/null 2>&1 && source <(fzf --zsh 2>/dev/null)'''
+order = 20
+
+[[item]]
+name = "autosuggestions"
+why = "fish-style ghost text from your history — accept with →"
+check = "test -r \"$(brew --prefix 2>/dev/null)/share/zsh-autosuggestions/zsh-autosuggestions.zsh\" || test -d \"$HOME/.local/share/zinit/plugins/zsh-users---zsh-autosuggestions\""
+active = "(( $+functions[_zsh_autosuggest_start] ))"
+brew = "zsh-autosuggestions"
+apt = "zsh-autosuggestions"
+snippet = '''
+for _p in "$(brew --prefix 2>/dev/null)/share/zsh-autosuggestions/zsh-autosuggestions.zsh" \
+          /usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh; do
+  [[ -r "$_p" ]] && source "$_p" && break
+done
+'''
+order = 30
+
+[[item]]
+name = "syntax-highlighting"
+why = "commands turn red before you run something that doesn't exist"
+check = "test -r \"$(brew --prefix 2>/dev/null)/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh\" || test -d \"$HOME/.local/share/zinit/plugins/zsh-users---zsh-syntax-highlighting\""
+active = "(( $+functions[_zsh_highlight] ))"
+brew = "zsh-syntax-highlighting"
+apt = "zsh-syntax-highlighting"
+snippet = '''
+for _p in "$(brew --prefix 2>/dev/null)/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh" \
+          /usr/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh; do
+  [[ -r "$_p" ]] && source "$_p" && break
+done
+'''
+order = 80
+
+[[item]]
+name = "statusline"
+why = "a battle-tested beautiful prompt (starship — or your existing powerlevel10k counts)"
+check = "command -v starship || test -d \"$HOME/.local/share/zinit/plugins/romkatv---powerlevel10k\""
+active = "(( $+functions[starship_precmd] || $+functions[p10k] ))"
+brew = "starship"
+apt = "starship"
+snippet = '''(( $+functions[p10k] )) || { command -v starship >/dev/null 2>&1 && eval "$(starship init zsh)" }'''
+post = "glyphs looking odd? run `termi fontcheck` — you likely need a Nerd Font (ORACLE P6)"
+order = 90

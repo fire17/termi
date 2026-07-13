@@ -1,0 +1,136 @@
+# jumpto — ⌘⌥←/→ enters a fuzzy jump-to-text mode inside the line (F17, EXPERIMENTAL)
+[pack]
+name = "jumpto"
+
+[[item]]
+name = "jumpto"
+why = "⌘⌥→ / ⌘⌥← : type text, jump to it inside the line — fuzzy, case-insensitive (experimental; TERMI_JUMPTO=0 disables)"
+check = "test -r \"$HOME/.termi/zsh.d/52-jumpto.zsh\""
+active = "(( $+functions[_termi_jumpto] ))"
+post = "run `termi keys apply` so your terminal actually sends ⌘⌥←/→ · turn it off anytime with TERMI_JUMPTO=0"
+order = 52
+snippet = '''
+# termi jumpto (EXPERIMENTAL — F17). ⌘⌥→ searches forward, ⌘⌥← backward.
+# In jumpto mode:  type = refine · ⌃N/↓/Tab = next · ⌃P/↑ = previous
+#                  ↵ = accept (stay there) · Esc/⌃C/⌃G = cancel (cursor goes back)
+#                  ⌫ = delete a search char
+# Off switch:      TERMI_JUMPTO=0   (bindings stay, the widget just declines)
+: ${TERMI_JUMPTO:=1}
+
+# Fills _termi_jm_out with "start end" pairs (0-based, end exclusive).
+# Exact case-insensitive substring matches win; only if there are NONE do we
+# fall back to a fuzzy subsequence match. No forks — this runs per keystroke.
+_termi_jump_matches() {
+  local buf=${(L)1} q=${(L)2}
+  local -i n=${#buf} m=${#q} i j k
+  _termi_jm_out=()
+  (( m == 0 || n == 0 )) && return
+  for (( i = 1; i <= n - m + 1; i++ )); do
+    [[ ${buf[i,i+m-1]} == $q ]] && _termi_jm_out+=( "$((i-1)) $((i-1+m))" )
+  done
+  (( ${#_termi_jm_out} )) && return
+  for (( i = 1; i <= n; i++ )); do            # fuzzy: chars in order, gaps ok
+    [[ ${buf[i]} != ${q[1]} ]] && continue
+    j=i; k=1
+    while (( k <= m && j <= n )); do
+      [[ ${buf[j]} == ${q[k]} ]] && (( k++ ))
+      (( j++ ))
+    done
+    (( k > m )) && _termi_jm_out+=( "$((i-1)) $((j-1))" )
+  done
+}
+
+# After an ESC: swallow the rest of a CSI/SS3 sequence, leave its final byte in
+# REPLY. Returns 1 if ESC arrived alone (a real Escape keypress = cancel).
+_termi_jump_csi() {
+  local c seq=""
+  REPLY=""
+  read -k 1 -t 0.06 c || return 1
+  [[ $c != '[' && $c != 'O' ]] && return 1
+  while read -k 1 -t 0.06 c; do
+    seq+=$c
+    [[ $c == [A-Za-z~] ]] && break
+  done
+  [[ -z $seq ]] && return 1
+  REPLY=${seq[-1]}
+  return 0
+}
+
+_termi_jumpto() {
+  if (( ! TERMI_JUMPTO )); then
+    zle -M "termi: jumpto is off (unset TERMI_JUMPTO=0 to enable)"
+    return 0
+  fi
+  local dir=$1 query="" key pair
+  local -i origin=$CURSOR idx=0 s e
+  local -a cand
+  local -a saved_hl=( "${region_highlight[@]}" )
+  while true; do
+    cand=()
+    if [[ -n $query ]]; then
+      _termi_jump_matches "$BUFFER" "$query"
+      for pair in "${_termi_jm_out[@]}"; do
+        s=${pair%% *}
+        if [[ $dir == fwd ]]; then
+          (( s > origin )) && cand+=( "$pair" )
+        else
+          (( s < origin )) && cand+=( "$pair" )
+        fi
+      done
+      [[ $dir == back ]] && cand=( "${(Oa)cand[@]}" )   # nearest-first backwards
+    fi
+    (( idx < 0 )) && idx=0
+    (( ${#cand} && idx >= ${#cand} )) && idx=$(( ${#cand} - 1 ))
+    region_highlight=()
+    if (( ${#cand} )); then
+      pair=${cand[idx+1]}
+      s=${pair%% *}; e=${pair##* }
+      CURSOR=$s
+      region_highlight=( "$s $e standout" )
+    else
+      CURSOR=$origin
+    fi
+    if (( ${#cand} )); then
+      POSTDISPLAY="  ⟨jumpto ${dir}⟩ ${query}  [$((idx+1))/${#cand}]"
+    elif [[ -n $query ]]; then
+      POSTDISPLAY="  ⟨jumpto ${dir}⟩ ${query}  (no match)"
+    else
+      POSTDISPLAY="  ⟨jumpto ${dir}⟩ type to search…"
+    fi
+    zle -R
+    read -k 1 key || break
+    case $key in
+      $'\n'|$'\r')            break ;;                       # accept
+      $'\x03'|$'\x07')        CURSOR=$origin; break ;;       # ⌃C / ⌃G cancel
+      $'\x7f'|$'\x08')        query=${query%?}; idx=0 ;;     # backspace
+      $'\x0e'|$'\t')          (( idx++ )) ;;                 # ⌃N / Tab → next
+      $'\x10')                (( idx-- )) ;;                 # ⌃P → previous
+      $'\e')
+        if _termi_jump_csi; then
+          case $REPLY in
+            D|A) (( idx-- )) ;;                              # ← / ↑ → previous
+            C|B) (( idx++ )) ;;                              # → / ↓ → next
+            Z)   (( idx-- )) ;;                              # ⇧Tab
+          esac
+        else
+          CURSOR=$origin; break                              # bare Esc = cancel
+        fi
+        ;;
+      *)                      query+=$key; idx=0 ;;
+    esac
+  done
+  POSTDISPLAY=""
+  region_highlight=( "${saved_hl[@]}" )
+  REGION_ACTIVE=0
+  zle -R
+}
+
+_termi_jumpto_fwd()  { _termi_jumpto fwd }
+_termi_jumpto_back() { _termi_jumpto back }
+zle -N _termi_jumpto_fwd
+zle -N _termi_jumpto_back
+
+# ⌘⌥←/→ on macOS, ⌃⌥←/→ elsewhere — both arrive as CSI modifier 7.
+bindkey '^[[1;7C' _termi_jumpto_fwd
+bindkey '^[[1;7D' _termi_jumpto_back
+'''

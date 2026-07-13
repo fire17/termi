@@ -1,0 +1,57 @@
+# modern-unix — the tools psst keeps whispering about
+[pack]
+name = "modern-unix"
+
+[[item]]
+name = "eza"
+why = "ls with colors, icons, git status"
+brew = "eza"
+apt = "eza"
+
+[[item]]
+name = "bat"
+why = "cat with syntax highlighting and paging"
+check = "command -v bat || command -v batcat"
+brew = "bat"
+apt = "bat"
+
+[[item]]
+name = "fd"
+why = "find, but friendly and fast"
+check = "command -v fd || command -v fdfind"
+brew = "fd"
+apt = "fd-find"
+
+[[item]]
+name = "ripgrep"
+why = "grep at ludicrous speed"
+check = "command -v rg"
+brew = "ripgrep"
+apt = "ripgrep"
+
+[[item]]
+name = "delta"
+why = "git diffs that are a joy to read"
+check = "command -v delta"
+brew = "git-delta"
+apt = "git-delta"
+post = "enable it: git config --global core.pager delta && git config --global interactive.diffFilter 'delta --color-only'"
+
+[[item]]
+name = "dust"
+why = "du as a picture — see what eats your disk"
+check = "command -v dust"
+brew = "dust"
+
+[[item]]
+name = "tealdeer"
+why = "man pages as examples — `tldr tar` and you're done"
+check = "command -v tldr"
+brew = "tealdeer"
+apt = "tealdeer"
+
+[[item]]
+name = "btop"
+why = "a system monitor you'll actually enjoy watching"
+brew = "btop"
+apt = "btop"

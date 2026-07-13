@@ -1,0 +1,97 @@
+# Termi terminal registry — detection + capability data (ORACLE ADR-12).
+# detect: env_any = any of these env vars present; term_program = $TERM_PROGRAM match.
+# writer: which managed-block config writer applies ("wezterm-lua" | "kitty-conf" |
+# "ghostty-conf") — or "gui" (instructions only, never poke a plist) or "none".
+# keys_status mirrors the honesty scale of shells.toml.
+
+[[terminal]]
+id = "wezterm"
+name = "WezTerm"
+env_any = ["WEZTERM_PANE"]
+term_program = "WezTerm"
+writer = "wezterm-lua"
+config = "~/.wezterm.lua"
+keys_status = "verified"
+tips = [
+  "~/.wezterm.lua →  send_composed_key_when_left_alt_is_pressed = false",
+  "no built-in click-to-move-cursor — word-jumps, ⌥⌫ and ⇧-select all still work; ⌃A/⌃E cover line ends",
+]
+
+[[terminal]]
+id = "kitty"
+name = "kitty"
+env_any = ["KITTY_WINDOW_ID"]
+writer = "kitty-conf"
+config = "~/.config/kitty/kitty.conf"
+keys_status = "untested"
+tips = ["~/.config/kitty/kitty.conf →  macos_option_as_alt yes",
+        "click-to-move-cursor comes from kitty's shell integration (on by default)"]
+
+[[terminal]]
+id = "ghostty"
+name = "Ghostty"
+env_any = ["GHOSTTY_RESOURCES_DIR", "GHOSTTY_BIN_DIR"]
+writer = "ghostty-conf"
+config = "~/.config/ghostty/config"
+keys_status = "untested"
+tips = ["~/.config/ghostty/config →  macos-option-as-alt = true",
+        "click-to-move-cursor comes from shell integration (on by default)"]
+
+[[terminal]]
+id = "iterm2"
+name = "iTerm2"
+term_program = "iTerm.app"
+writer = "gui"
+keys_status = "documented"
+tips = [
+  "Settings → Profiles → Keys → Left Option key: Esc+   (⌥←/→ start jumping words)",
+  "Settings → Pointer → tick Option-click moves cursor",
+  "⌘←/⌘→: Keys → Key Mappings → ⌘← “Send Escape Sequence” [H · ⌘→ → [F",
+]
+
+[[terminal]]
+id = "terminal.app"
+name = "Terminal.app"
+term_program = "Apple_Terminal"
+writer = "gui"
+keys_status = "documented"
+tips = [
+  "Settings → Profiles → Keyboard → tick Use Option as Meta key",
+  "⌥-click already moves the cursor here",
+  "⌘←/⌘→: Keyboard → + → “Send Text” \\033[H and \\033[F",
+]
+
+[[terminal]]
+id = "alacritty"
+name = "Alacritty"
+env_any = ["ALACRITTY_WINDOW_ID", "ALACRITTY_SOCKET"]
+writer = "gui"
+config = "~/.config/alacritty/alacritty.toml"
+keys_status = "documented"
+tips = ["alacritty.toml → [window] option_as_alt = \"Both\"",
+        "⌘←/⌘→: [[keyboard.bindings]] key=\"Left\" mods=\"Command\" chars=\"\\u001b[H\" (and Right → \\u001b[F)"]
+
+[[terminal]]
+id = "vscode"
+name = "VS Code terminal"
+term_program = "vscode"
+writer = "gui"
+keys_status = "documented"
+tips = ["settings.json → \"terminal.integrated.macOptionIsMeta\": true",
+        "⌘←/⌘→: bind to workbench.action.terminal.sendSequence with {\"text\": \"\\u001b[H\"}"]
+
+[[terminal]]
+id = "warp"
+name = "Warp"
+term_program = "WarpTerminal"
+writer = "none"
+keys_status = "unsupported"
+tips = ["Warp uses its own editor keybindings — most ZLE bindings won't reach the shell"]
+
+[[terminal]]
+id = "windows-terminal"
+name = "Windows Terminal"
+env_any = ["WT_SESSION"]
+writer = "gui"
+keys_status = "planned"
+tips = ["settings.json → actions: sendInput \\u001b[H for ctrl+left etc. (NOT live-verified — no Windows box)"]

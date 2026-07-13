@@ -1,0 +1,118 @@
+# keys — make your shell edit like a real application (F16)
+[pack]
+name = "keys"
+
+[[item]]
+name = "editor-keys"
+why = "⌥←/→ jump words · ⌥⌫ deletes a word · ⇧⌥←/→ selects text · ⌘←/→ line ends — like any normal app"
+check = "test -r \"$HOME/.termi/zsh.d/50-editor-keys.zsh\""
+active = "(( $+functions[_termi_sel] ))"
+post = "run `termi keys` for your terminal's ⌥-key + click-to-move-cursor settings (the emulator half)"
+order = 50
+snippet = '''
+# termi keys — the shell half of F16. Bind EVERY sequence the common emulators
+# send for a given key; the ones your terminal never sends are simply inert.
+# Escape hatch: TERMI_KEYS_TYPE_OVER=0 disables typing-replaces-selection.
+
+# Words break on / - _ . like a normal editor (zsh's default WORDCHARS is greedy)
+autoload -Uz select-word-style
+select-word-style bash
+
+# ── motion: by word (⌥←/→, ⌃←/→) ──────────────────────────────────────
+for _s in '^[[1;3C' '^[[1;5C' '^[[1;9C' '^[^[[C' '^[[5C' '^[f'; do
+  bindkey "$_s" forward-word
+done
+for _s in '^[[1;3D' '^[[1;5D' '^[[1;9D' '^[^[[D' '^[[5D' '^[b'; do
+  bindkey "$_s" backward-word
+done
+unset _s
+
+# ── motion: line ends (⌘←/→ if mapped, Home/End, ⌃A/⌃E) ───────────────
+bindkey '^[[H'  beginning-of-line
+bindkey '^[[1~' beginning-of-line
+bindkey '^[[F'  end-of-line
+bindkey '^[[4~' end-of-line
+bindkey '^A'    beginning-of-line
+bindkey '^E'    end-of-line
+
+# ── deletion by word / line (⌥⌫, ⌘⌫, fn+⌫) ────────────────────────────
+bindkey '^[^?'    backward-kill-word    # ⌥⌫  (ESC DEL)
+bindkey '^[^H'    backward-kill-word
+bindkey '^W'      backward-kill-word
+bindkey '^[d'     kill-word             # ⌥ + forward-delete
+bindkey '^[[3;3~' kill-word
+bindkey '^[[3;5~' kill-word
+bindkey '^U'      backward-kill-line    # ⌘⌫ when the emulator sends ^U
+# (plain forward-delete '^[[3~' is bound below to _termi_delete, selection-aware)
+
+# ── selection like a normal app (⇧ + arrows, ⇧⌥ + arrows) ─────────────
+# zsh has no native shift-select; build it on MARK + REGION_ACTIVE.
+_termi_sel() {                      # start/extend the highlighted region
+  (( REGION_ACTIVE )) || { MARK=$CURSOR; REGION_ACTIVE=1 }
+  zle $1
+}
+_termi_drop() { REGION_ACTIVE=0; zle $1 }   # plain motion clears it
+
+for _w in backward-char forward-char backward-word forward-word \
+          beginning-of-line end-of-line up-line-or-history down-line-or-history; do
+  eval "_termi_sel_${_w//-/_}()  { _termi_sel  $_w }; zle -N _termi_sel_${_w//-/_}"
+  eval "_termi_drop_${_w//-/_}() { _termi_drop $_w }; zle -N _termi_drop_${_w//-/_}"
+done
+unset _w
+
+bindkey '^[[1;2D' _termi_sel_backward_char          # ⇧←
+bindkey '^[[1;2C' _termi_sel_forward_char           # ⇧→
+bindkey '^[[1;2A' _termi_sel_up_line_or_history     # ⇧↑
+bindkey '^[[1;2B' _termi_sel_down_line_or_history   # ⇧↓
+bindkey '^[[1;4D' _termi_sel_backward_word          # ⇧⌥←
+bindkey '^[[1;4C' _termi_sel_forward_word           # ⇧⌥→
+bindkey '^[[1;6D' _termi_sel_backward_word          # ⇧⌃←
+bindkey '^[[1;6C' _termi_sel_forward_word           # ⇧⌃→
+bindkey '^[[1;2H' _termi_sel_beginning_of_line      # ⇧Home
+bindkey '^[[1;2F' _termi_sel_end_of_line            # ⇧End
+
+# plain arrows drop the selection (as any editor does)
+bindkey '^[[D' _termi_drop_backward_char
+bindkey '^[[C' _termi_drop_forward_char
+
+# ⌫ / delete kill the selection when one is active
+_termi_backspace() {
+  if (( REGION_ACTIVE )); then zle kill-region; REGION_ACTIVE=0
+  else zle backward-delete-char; fi
+}
+_termi_delete() {
+  if (( REGION_ACTIVE )); then zle kill-region; REGION_ACTIVE=0
+  else zle delete-char; fi
+}
+zle -N _termi_backspace
+zle -N _termi_delete
+bindkey '^?'    _termi_backspace
+bindkey '^H'    _termi_backspace
+bindkey '^[[3~' _termi_delete
+
+# typing over a selection replaces it (opt out: TERMI_KEYS_TYPE_OVER=0)
+: ${TERMI_KEYS_TYPE_OVER:=1}
+if (( TERMI_KEYS_TYPE_OVER )); then
+  _termi_self_insert() {
+    (( REGION_ACTIVE )) && { zle kill-region; REGION_ACTIVE=0 }
+    zle .self-insert
+  }
+  zle -N self-insert _termi_self_insert
+fi
+'''
+
+[item.variants.bash]
+snippet = '''
+# termi keys (bash core) — readline gets the same word/line motions.
+# ⇧-selection is a ZLE feature; readline has no region → zsh keeps that crown.
+if [ -n "$BASH_VERSION" ]; then
+  bind '"\e[1;3C": forward-word'      2>/dev/null   # ⌥→
+  bind '"\e[1;3D": backward-word'     2>/dev/null   # ⌥←
+  bind '"\e[1;5C": forward-word'      2>/dev/null   # ⌃→
+  bind '"\e[1;5D": backward-word'     2>/dev/null   # ⌃←
+  bind '"\e[H":    beginning-of-line' 2>/dev/null   # ⌘← (via terminal, P19)
+  bind '"\e[F":    end-of-line'       2>/dev/null   # ⌘→
+  bind '"\e\x7f":  backward-kill-word' 2>/dev/null  # ⌥⌫
+  bind '"\e[3~":   delete-char'       2>/dev/null
+fi
+'''

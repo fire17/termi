@@ -1,0 +1,133 @@
+# Termi shell registry — adding a shell = adding an entry here (ORACLE ADR-12).
+# status per feature: verified (tested on a real machine) | native (the shell/toolkit
+# already provides it) | core (mechanism works, thin coverage) | planned | untested.
+# NEVER overstate: the coverage matrix renders straight from these words.
+
+[[shell]]
+id = "zsh"
+name = "Zsh"
+detect = "command -v zsh"
+rc = "~/.zshrc"
+comment = "#"
+dir = "zsh.d"
+ext = ".zsh"
+loader_file = "termi.zsh"
+block = '[[ -r "$HOME/.termi/termi.zsh" ]] && source "$HOME/.termi/termi.zsh"'
+loader = '''
+# termi shell loader — sources every enabled snippet. Managed by termi.
+for _termi_f in "$HOME/.termi/zsh.d"/*.zsh(N); do
+  source "$_termi_f"
+done
+unset _termi_f
+export TERMI_ACTIVE=zsh
+'''
+probe = ["zsh", "-ic"]
+probe_echo = "print -r -- TERMIA:$TERMI_ACTIVE"
+[shell.features]
+block = "verified"
+recover = "verified"
+keys = "verified"
+jumpto = "verified"
+packs = "verified"
+
+[[shell]]
+id = "bash"
+name = "Bash"
+detect = "command -v bash"
+rc = "~/.bashrc"
+comment = "#"
+dir = "bash.d"
+ext = ".bash"
+loader_file = "termi.bash"
+block = '[ -r "$HOME/.termi/termi.bash" ] && . "$HOME/.termi/termi.bash"'
+loader = '''
+# termi shell loader — sources every enabled snippet. Managed by termi.
+for _termi_f in "$HOME/.termi/bash.d"/*.bash; do
+  [ -r "$_termi_f" ] && . "$_termi_f"
+done
+unset _termi_f
+export TERMI_ACTIVE=bash
+'''
+probe = ["bash", "-ic"]
+probe_echo = "echo TERMIA:$TERMI_ACTIVE"
+notes = "macOS opens LOGIN shells: ~/.bash_profile must chain ~/.bashrc (doctor checks — P24)"
+[shell.features]
+block = "verified"
+recover = "verified"
+keys = "core"
+jumpto = "planned"
+packs = "planned"
+
+[[shell]]
+id = "fish"
+name = "Fish"
+detect = "command -v fish"
+rc = "~/.config/fish/config.fish"
+comment = "#"
+dir = "fish.d"
+ext = ".fish"
+loader_file = "termi.fish"
+block = 'test -r "$HOME/.termi/termi.fish"; and source "$HOME/.termi/termi.fish"'
+loader = '''
+# termi shell loader — sources every enabled snippet. Managed by termi.
+for _termi_f in $HOME/.termi/fish.d/*.fish
+  source $_termi_f
+end
+set -gx TERMI_ACTIVE fish
+'''
+probe = ["fish", "-ic"]
+probe_echo = "echo TERMIA:$TERMI_ACTIVE"
+notes = "fish ships autosuggestions + syntax highlighting natively"
+[shell.features]
+block = "verified"
+recover = "planned"
+keys = "native"
+jumpto = "planned"
+packs = "planned"
+
+[[shell]]
+id = "powershell"
+name = "PowerShell"
+detect = "command -v pwsh || command -v powershell"
+rc = "~/.config/powershell/Microsoft.PowerShell_profile.ps1"
+rc_windows = "~/Documents/PowerShell/Microsoft.PowerShell_profile.ps1"
+comment = "#"
+dir = "ps.d"
+ext = ".ps1"
+loader_file = "termi.ps1"
+block = 'if (Test-Path "$HOME/.termi/termi.ps1") { . "$HOME/.termi/termi.ps1" }'
+loader = '''
+# termi shell loader — sources every enabled snippet. Managed by termi.
+Get-ChildItem "$HOME/.termi/ps.d/*.ps1" -ErrorAction SilentlyContinue |
+  ForEach-Object { . $_.FullName }
+$env:TERMI_ACTIVE = "powershell"
+'''
+probe = ["pwsh", "-Command"]
+probe_echo = 'Write-Output "TERMIA:$env:TERMI_ACTIVE"'
+notes = "keys largely native via PSReadLine; Windows-native paths NOT live-verified (no Windows box) — pwsh mechanics verified on macOS"
+[shell.features]
+block = "verified"
+recover = "verified"
+keys = "native"
+jumpto = "planned"
+packs = "planned"
+
+[[shell]]
+id = "nushell"
+name = "Nushell"
+detect = "command -v nu"
+rc = "~/.config/nushell/config.nu"
+comment = "#"
+dir = "nu.d"
+ext = ".nu"
+loader_file = "termi.nu"
+block = 'source ~/.termi/termi.nu'
+loader = "# termi loader for nushell — planned (nu sources at parse time; needs generated static file)\n"
+probe = ["nu", "-c"]
+notes = "nu `source` resolves at parse time — loader must be a generated static file; planned"
+[shell.features]
+block = "planned"
+recover = "planned"
+keys = "planned"
+jumpto = "planned"
+packs = "planned"

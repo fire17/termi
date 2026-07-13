@@ -1,0 +1,37 @@
+# dev — the daily-driver developer layer
+[pack]
+name = "dev"
+
+[[item]]
+name = "gh"
+why = "GitHub from the command line — PRs, issues, releases"
+brew = "gh"
+apt = "gh"
+
+[[item]]
+name = "mise"
+why = "one tool for every runtime version (node, python, go…) — the asdf successor"
+check = "command -v mise"
+active = "(( $+functions[_mise_hook] ))"
+brew = "mise"
+snippet = '''command -v mise >/dev/null 2>&1 && eval "$(mise activate zsh)"'''
+order = 35
+
+[[item]]
+name = "direnv"
+why = "per-project env vars that load when you cd in, unload when you leave"
+check = "command -v direnv"
+active = "(( $+functions[_direnv_hook] ))"
+brew = "direnv"
+apt = "direnv"
+snippet = '''command -v direnv >/dev/null 2>&1 && eval "$(direnv hook zsh)"'''
+order = 36
+
+[[item]]
+name = "atuin"
+why = "shell history superpowers — searchable, syncable (encrypted), forever"
+check = "command -v atuin"
+active = "(( $+functions[_atuin_precmd] || $+functions[_atuin_preexec] ))"
+brew = "atuin"
+snippet = '''command -v atuin >/dev/null 2>&1 && eval "$(atuin init zsh)"'''
+order = 37

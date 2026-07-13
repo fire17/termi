@@ -1,0 +1,47 @@
+# Termi harness registry — agent harnesses the bundled skill can install into.
+# Adding a harness = adding an entry (ORACLE ADR-12). dir_status: verified = the
+# skills dir layout is confirmed real; guessed = best-known convention, install only
+# proceeds if the dir (or its parent harness dir) actually exists + user consents.
+
+[[harness]]
+id = "claude-code"
+name = "Claude Code"
+detect = "command -v claude || test -d ~/.claude"
+skills_dir = "~/.claude/skills"
+dir_status = "verified"
+
+[[harness]]
+id = "codex"
+name = "Codex"
+detect = "command -v codex || test -d ~/.codex"
+skills_dir = "~/.codex/skills"
+dir_status = "verified"
+notes = "codex >= 0.129 reads the same SKILL.md format"
+
+[[harness]]
+id = "opencode"
+name = "OpenCode"
+detect = "command -v opencode || test -d ~/.opencode"
+skills_dir = "~/.config/opencode/skills"
+dir_status = "guessed"
+
+[[harness]]
+id = "pi"
+name = "Pi"
+detect = "command -v pi"
+skills_dir = "~/.pi/skills"
+dir_status = "guessed"
+
+[[harness]]
+id = "openclaw"
+name = "OpenClaw"
+detect = "command -v openclaw || test -d ~/.openclaw"
+skills_dir = "~/.openclaw/skills"
+dir_status = "guessed"
+
+[[harness]]
+id = "hermes"
+name = "Hermes"
+detect = "command -v hermes"
+skills_dir = "~/.hermes/skills"
+dir_status = "guessed"

@@ -1,0 +1,86 @@
+# recover — typos happen; termi catches them (F2)
+[pack]
+name = "recover"
+
+[[item]]
+name = "auto-recover"
+why = "typo a command and termi preloads the fix — press ↵ to run it (never auto-runs)"
+check = "test -r \"$HOME/.termi/zsh.d/55-auto-recover.zsh\""
+# HONEST probe: our function existing is not enough — the hook must actually be OURS
+# (2026-07-13: doctor reported ✓active while a pre-existing handler owned the hook).
+active = "[[ ${functions[command_not_found_handler]} == *_termi_recover* ]]"
+post = "unknown commands with no close match still fall through to whatever handler you already had"
+order = 55
+snippet = '''
+_termi_recover() {
+  local cmd=$1; shift
+  local fix
+  fix=$(command termi _suggest "$cmd" 2>/dev/null)
+  if [[ -n $fix ]]; then
+    print -P "termi 💛 %F{yellow}${cmd}%f not found — did you mean %F{green}${fix}%f? (preloaded — just press ↵)"
+    print -z -- "${fix}${*:+ $*}"
+    return 127
+  fi
+  # no close match: hand back to whatever handler existed before us (brew's,
+  # ubuntu's, your own) — chain, never clobber.
+  if (( $+functions[_termi_cnf_prev] )); then
+    _termi_cnf_prev "$cmd" "$@"
+    return $?
+  fi
+  print -u2 "zsh: command not found: $cmd"
+  return 127
+}
+
+# Adopt any existing handler as our fallback — unless it's already ours
+# (guards against re-sourcing this file into infinite recursion).
+if (( $+functions[command_not_found_handler] )) && \
+   [[ ${functions[command_not_found_handler]} != *_termi_recover* ]]; then
+  functions -c command_not_found_handler _termi_cnf_prev
+fi
+
+command_not_found_handler() {
+  _termi_recover "$@"
+}
+'''
+
+[item.variants.bash]
+snippet = '''
+_termi_recover() {
+  local cmd=$1; shift
+  local fix
+  fix=$(command termi _suggest "$cmd" 2>/dev/null)
+  if [ -n "$fix" ]; then
+    printf 'termi \360\237\222\233 %s not found — did you mean \033[32m%s\033[0m? (press ↑ to accept)\n' "$cmd" "$fix" >&2
+    history -s "$fix${*:+ $*}"   # bash has no print -z: preload history instead
+    return 127
+  fi
+  if declare -F _termi_cnf_prev >/dev/null; then
+    _termi_cnf_prev "$cmd" "$@"; return $?
+  fi
+  printf 'bash: %s: command not found\n' "$cmd" >&2
+  return 127
+}
+# chain any existing handle (ubuntu's command-not-found etc) — never clobber
+if declare -F command_not_found_handle >/dev/null && \
+   ! declare -f command_not_found_handle | grep -q _termi_recover; then
+  eval "$(declare -f command_not_found_handle | sed '1s/command_not_found_handle/_termi_cnf_prev/')"
+fi
+command_not_found_handle() {
+  _termi_recover "$@"
+}
+'''
+
+[item.variants.powershell]
+snippet = '''
+# termi auto-recover (core): suggests, never auto-runs (ADR-8).
+$ExecutionContext.InvokeCommand.CommandNotFoundAction = {
+    param($Name, $EventArgs)
+    # pwsh probes get-<name> etc. internally — only react to the raw typo
+    if ($Name.StartsWith("get-") -or $Name.Contains("\\")) { return }
+    $fix = & termi _suggest $Name 2>$null
+    if ($fix) {
+        Write-Host "termi 💛 $Name not found — did you mean " -NoNewline -ForegroundColor Yellow
+        Write-Host $fix -ForegroundColor Green
+    }
+}
+'''

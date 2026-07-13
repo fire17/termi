@@ -1,0 +1,30 @@
+# hermetic fixture pack — exercises all three honesty states (ORACLE P7)
+[pack]
+name = "testpack"
+
+[[item]]
+name = "alpha"
+why = "installed; becomes active ONLY via the real chain: block → loader → snippet"
+check = "true"
+active = "[[ -n $TERMI_TEST_ALPHA ]]"
+snippet = "export TERMI_TEST_ALPHA=1"
+order = 10
+
+[[item]]
+name = "beta"
+why = "never installed"
+check = "false"
+
+[[item]]
+name = "gamma"
+why = "installed but never active — the half-success that lies"
+check = "true"
+active = "false"
+
+[[item]]
+name = "delta"
+why = "shell-native: a snippet, no brew/apt — must still install (regression 2026-07-13)"
+check = "test -r \"$TERMI_DIR/zsh.d/60-delta.zsh\""
+active = "[[ -n $TERMI_TEST_DELTA ]]"
+snippet = "export TERMI_TEST_DELTA=1"
+order = 60
